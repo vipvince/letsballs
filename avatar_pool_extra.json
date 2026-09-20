@@ -1,0 +1,110 @@
+[
+  {
+    "file": "kick_kangaroo.png",
+    "emoji": "🦘",
+    "label": "kick kangaroo",
+    "tags": [
+      "kangaroo",
+      "jump",
+      "aussie"
+    ]
+  },
+  {
+    "file": "float_flamingo.png",
+    "emoji": "🦩",
+    "label": "float flamingo",
+    "tags": [
+      "flamingo",
+      "pink",
+      "beach"
+    ]
+  },
+  {
+    "file": "pulse_penguin.png",
+    "emoji": "🐧",
+    "label": "pulse penguin",
+    "tags": [
+      "penguin",
+      "cute",
+      "ice"
+    ]
+  },
+  {
+    "file": "quake_quokka.png",
+    "emoji": "😊",
+    "label": "quake quokka",
+    "tags": [
+      "quokka",
+      "smile",
+      "happy"
+    ]
+  },
+  {
+    "file": "turbo_tiger.png",
+    "emoji": "🐯",
+    "label": "turbo tiger",
+    "tags": [
+      "tiger",
+      "power",
+      "cat"
+    ]
+  },
+  {
+    "file": "boba_bunny.png",
+    "emoji": "🐰",
+    "label": "boba bunny",
+    "tags": [
+      "bunny",
+      "boba",
+      "tea",
+      "🧋"
+    ]
+  },
+  {
+    "file": "ramen_raccoon.png",
+    "emoji": "🦝",
+    "label": "ramen raccoon",
+    "tags": [
+      "raccoon",
+      "ramen",
+      "foodie",
+      "🍜"
+    ]
+  },
+  {
+    "file": "xiao_long_cat.png",
+    "emoji": "🐱",
+    "label": "xiao long cat",
+    "tags": [
+      "cat",
+      "dumpling",
+      "xiaolongbao",
+      "foodie",
+      "🐱"
+    ]
+  },
+  {
+    "file": "comic_corgi.png",
+    "emoji": "🐶",
+    "label": "comic corgi",
+    "tags": [
+      "corgi",
+      "dog",
+      "cute",
+      "fun"
+    ]
+  },
+  {
+    "file": "ballet_butterfly_cat.png",
+    "emoji": "🐱",
+    "label": "ballet butterfly cat",
+    "tags": [
+      "cat",
+      "🦋",
+      "butterfly",
+      "pretty",
+      "🐱",
+      "🐈"
+    ]
+  }
+]
