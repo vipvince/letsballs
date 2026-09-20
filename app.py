@@ -34,6 +34,7 @@ except ImportError:
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tennis.db")
 AVATAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatars")
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PROFILE_DIR = os.path.join(AVATAR_DIR, "profiles")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.newcoin.top/v1").rstrip("/")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v3.2")
@@ -5605,8 +5606,29 @@ def _file_to_data_uri(path: str) -> str:
         "jpeg": "image/jpeg",
         "webp": "image/webp",
         "gif": "image/gif",
+        "mp4": "video/mp4",
     }.get(ext, "image/png")
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+_MEDIA_URI_CACHE: dict[str, str] = {}
+
+
+def _hosted_media_url(path: str) -> str:
+    """Inline a local image or video so the hosted site can show it.
+
+    Streamlit Community Cloud answers /app/static/... with a login redirect,
+    so a video or img pointed there stays blank even after you open the app.
+    """
+    if not path or not os.path.isfile(path):
+        return ""
+    cached = _MEDIA_URI_CACHE.get(path)
+    if cached:
+        return cached
+    uri = _file_to_data_uri(path)
+    if uri:
+        _MEDIA_URI_CACHE[path] = uri
+    return uri
 
 
 def resolve_media_path(path: Optional[str]) -> str:
@@ -6165,18 +6187,26 @@ def render_little_tennis_header() -> None:
     buttons: list[str] = []
     for name in choose_rail_avatars():
         label = os.path.splitext(name)[0].replace("_", " ")
-        src = "/app/static/pool/" + quote_plus(name)
+        path = os.path.join(STATIC_DIR, "pool", name)
+        if not os.path.isfile(path):
+            path = os.path.join(AVATAR_DIR, name)
+        src = _hosted_media_url(path)
+        if not src:
+            continue
         buttons.append(
             f'<button type="button" class="critter" aria-label="{label}">'
             f'<img src="{src}" alt="" />'
             f"</button>"
         )
+    poster = _hosted_media_url(os.path.join(STATIC_DIR, "poster.jpg"))
+    film = _hosted_media_url(os.path.join(STATIC_DIR, "video.mp4"))
+    poster_attr = f' poster="{poster}"' if poster else ""
+    src_attr = f' src="{film}"' if film else ""
     st.markdown(
         '<header class="lt-head">'
         '<p class="lt-brand">www.playplaytennis.com</p>'
         '<div class="lt-stage">'
-        '<video class="lt-film" playsinline preload="auto" '
-        'poster="/app/static/poster.jpg" src="/app/static/video.mp4"></video>'
+        f'<video class="lt-film" playsinline preload="auto"{poster_attr}{src_attr}></video>'
         '<button type="button" class="lt-sound" aria-pressed="true" aria-label="Mute sound">Mute</button>'
         "</div>"
         f'<div class="lt-rail">{"".join(buttons)}</div>'
