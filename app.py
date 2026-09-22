@@ -6024,7 +6024,12 @@ def inject_styles() -> None:
           [data-testid="stAppDeployButton"], .stDeployButton,
           [data-testid="stHeaderActionElements"],
           div[class*="viewerBadge"], a[href*="streamlit.io"],
-          a[href*="streamlitapp.com"], a[href*="share.streamlit.io"] {
+          a[href*="streamlitapp.com"], a[href*="share.streamlit.io"],
+          [data-testid="stBaseButton-header"],
+          [data-testid="stBaseButton-headerNoPadding"],
+          button[kind="header"],
+          .stAppDeployButton,
+          div[data-testid="stActionButtonIcon"] {
             display: none !important;
             visibility: hidden !important;
             pointer-events: none !important;
@@ -6337,6 +6342,22 @@ def inject_styles() -> None:
             :root { --chat-w: calc(100vw - 20px); }
             .lt-film { height: 72px; }
             .lt-rail { gap: 0.35rem; }
+            /* Lift chat bar above Streamlit Cloud / mobile chrome badges */
+            [data-testid="stBottom"] {
+              padding-bottom: calc(3.4rem + env(safe-area-inset-bottom)) !important;
+              z-index: 1100 !important;
+            }
+            [data-testid="stBottomBlockContainer"] {
+              padding-bottom: 0.35rem !important;
+            }
+            [data-testid="stAppScrollToBottomContainer"] {
+              height: calc(100dvh - 132px) !important;
+              max-height: calc(100dvh - 132px) !important;
+            }
+            .block-container {
+              min-height: calc(100dvh - 132px) !important;
+              padding-bottom: 0.8rem !important;
+            }
           }
         </style>
         """,
