@@ -859,16 +859,19 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
 def game_join_reply(status: str, game: dict) -> str:
     when = (game or {}).get("when_text") or "the next session"
     loc = (game or {}).get("location") or DEFAULT_GAME_LOCATION
+    wa = f"[Join the WhatsApp group]({WHATSAPP_GROUP_URL})"
     if status == "none":
         return "There is no game on the board right now."
     if status == "full":
         return f"**{when}** @ {loc} is full."
     if status == "already":
-        return f"You’re already in for **{when}** @ {loc}."
+        return (
+            f"You’re already in for **{when}** @ {loc}.\n\n"
+            f"For logistics (court, timing, who’s coming), {wa}."
+        )
     return (
         f"You’re in for **{when}** @ {loc}.\n\n"
-        "Join the WhatsApp group so we stay connected:\n"
-        f"{WHATSAPP_GROUP_URL}"
+        f"Tap in for logistics — court updates and who’s coming:\n{wa}"
     )
 
 
@@ -5856,12 +5859,22 @@ def inject_styles() -> None:
             background: transparent !important;
           }
           #MainMenu, footer, [data-testid="stToolbar"],
-          [data-testid="stDecoration"], [data-testid="stStatusWidget"] {
+          [data-testid="stDecoration"], [data-testid="stStatusWidget"],
+          [data-testid="stAppDeployButton"], .stDeployButton,
+          [data-testid="stHeaderActionElements"],
+          div[class*="viewerBadge"], a[href*="streamlit.io"],
+          a[href*="streamlitapp.com"], a[href*="share.streamlit.io"] {
             display: none !important;
+            visibility: hidden !important;
+            pointer-events: none !important;
+            width: 0 !important;
+            height: 0 !important;
+            overflow: hidden !important;
           }
           header[data-testid="stHeader"] {
             background: transparent !important;
             height: 0 !important;
+            min-height: 0 !important;
           }
 
           [data-testid="stAppScrollToBottomContainer"] {
@@ -5926,9 +5939,9 @@ def inject_styles() -> None:
             bottom: 0 !important;
             top: auto !important;
             height: auto !important;
-            z-index: 40 !important;
+            z-index: 1000 !important;
             background: #f6f5f2 !important;
-            padding: 0 0 0.7rem !important;
+            padding: 0 0 max(0.7rem, env(safe-area-inset-bottom)) !important;
             margin: 0 !important;
           }
           [data-testid="stBottomBlockContainer"] {
@@ -5986,9 +5999,9 @@ def inject_styles() -> None:
             white-space: normal !important;
           }
           [data-testid="stChatMessageContent"] a {
-            color: inherit !important;
-            text-decoration: none !important;
-            pointer-events: none;
+            color: #244033 !important;
+            text-decoration: underline !important;
+            pointer-events: auto !important;
           }
           [data-testid="stChatMessageAvatarAssistant"],
           [data-testid="stChatMessageAvatarUser"] {
@@ -6004,6 +6017,8 @@ def inject_styles() -> None:
           }
 
           [data-testid="stChatInput"] {
+            position: relative !important;
+            z-index: 1001 !important;
             background: #ffffff !important;
             border: 1px solid rgba(26, 31, 28, 0.12) !important;
             border-radius: 14px !important;
@@ -6027,6 +6042,8 @@ def inject_styles() -> None:
             background: #3d5c4a !important;
             color: #f7f4ef !important;
             border-radius: 12px !important;
+            position: relative !important;
+            z-index: 1002 !important;
           }
           [data-testid="stChatInputSubmitButton"]:hover { background: #314a3c !important; }
           [data-testid="stAlert"] {
@@ -6336,6 +6353,145 @@ def _begin_pin_signup(
     )
 
 
+def _sit_tight_line(at: str) -> str:
+    return random.choice(
+        [
+            "Sit tight — thinking…",
+            "Loading the vibes…",
+            "Building your court pass…",
+            "Looking for UFOs… back in a sec.",
+            "Hold that serve — still loading.",
+            "Warming up the ball machine…",
+            "One moment. Counting tennis balls.",
+            "Don’t bounce yet — almost there.",
+        ]
+    )
+
+
+def _apply_hk_name_prior(handle: str, demo: dict) -> None:
+    if (demo.get("nationality") or "unknown") != "unknown":
+        return
+    fn = (demo.get("first_name") or "").lower().replace(" ", "")
+    toks = set(_handle_name_tokens(handle))
+    if (
+        fn in _FEM_GIVEN
+        or "yee" in fn
+        or "manyee" in handle.lower()
+        or any(t in _FEM_GIVEN or t in _CJK_SURNAMES for t in toks)
+    ):
+        demo["nationality"] = "Hong Kong"
+        demo["evidence"] = (demo.get("evidence") or "") + "; Cantonese name prior → Hong Kong"
+
+
+def _ig_scan_and_signup(handle: str) -> None:
+    """Long Instagram lookup + gate + character. Call after a sit-tight message."""
+    at = format_handle(handle)
+    if handle not in ADMIN_HANDLES and _indown_lookup(handle).get("missing"):
+        drop_unfinished_handle(handle)
+        _tell_profile_missing(at)
+        return
+
+    ensure_pending_handle(handle)
+    existing = get_user_by_handle(handle)
+
+    resolved = resolve_member_profile(handle)
+    scrape = resolved["scrape"]
+    if scrape.get("profile_missing") and handle not in ADMIN_HANDLES:
+        drop_unfinished_handle(handle)
+        _tell_profile_missing(at)
+        return
+
+    card_ok = _profile_card_seen(scrape) or handle in ADMIN_HANDLES
+    if not card_ok:
+        if existing and existing.get("ig_photo_path") and existing.get("animal") and not existing.get("pin_hash"):
+            mascot = existing.get("mascot") or existing.get("animal") or handle
+            animal_raw = existing.get("animal") or mascot
+            display_name = (
+                mascot if not re.search(r"[A-Za-z\u4e00-\u9fff]", animal_raw or "") else animal_raw
+            )
+            emoji = existing.get("animal_emoji") or "🎾"
+            avatar_path = existing.get("avatar_path") or ""
+            ig_photo = existing.get("ig_photo_path") or ""
+            st.session_state.pending_handle = handle
+            st.session_state.pending_animal = display_name
+            st.session_state.pending_vibe = existing.get("vibe") or ""
+            st.session_state.pending_emoji = emoji
+            st.session_state.pending_mascot = mascot
+            st.session_state.pending_avatar = avatar_path
+            st.session_state.pending_ig_photo = ig_photo
+            st.session_state.auth_state = NEED_PIN_SIGNUP
+            if existing.get("ai_enabled") is not None and not int(existing.get("ai_enabled") or 0):
+                _lock_handle_session(handle)
+            photo_path = animal_photo_path(mascot, avatar_path)
+            append_assistant(
+                f"Welcome back mid-signup, {at} — you’re still **{display_name}** {emoji}\n\n"
+                "Set your **4-digit PIN** to finish (no IG re-scan).",
+                image=photo_path if isinstance(photo_path, str) and os.path.isfile(photo_path) else None,
+            )
+            return
+        drop_unfinished_handle(handle)
+        _tell_profile_unreadable(at)
+        return
+
+    scraped_text = scrape.get("text") or f"instagram_handle:{handle}"
+    ig_photo = scrape.get("ig_photo_path") or (existing or {}).get("ig_photo_path") or ""
+    demo = resolved["demo"]
+    _apply_hk_name_prior(handle, demo)
+
+    eligible, gate_detail = settle_gate(handle, demo)
+    if eligible:
+        display_name, vibe, emoji, mascot, avatar_path = assign_animal_and_vibe(
+            handle, scraped_text, scrape=scrape
+        )
+        ai_flag = 1
+        assign_why = (scrape or {}).get("assign_why") or ""
+    else:
+        display_name, vibe, emoji, mascot, avatar_path = assign_club_tennis()
+        ai_flag = 0
+        assign_why = "Club tennis ball — the gate kept them out, so they did not get a matched animal."
+
+    upsert_pending_user(
+        handle,
+        display_name,
+        vibe,
+        emoji,
+        mascot=mascot,
+        avatar_path=avatar_path,
+        ig_photo_path=ig_photo,
+        gender=demo.get("gender") or "",
+        nationality=demo.get("nationality") or "",
+        age_guess=demo.get("age_guess") or "",
+        ai_enabled=ai_flag,
+        gate_detail=gate_detail,
+        assign_why=assign_why,
+    )
+    _begin_pin_signup(
+        handle,
+        display_name,
+        vibe,
+        emoji,
+        mascot,
+        avatar_path,
+        ig_photo,
+        demo,
+        scrape,
+        bool(eligible),
+    )
+
+
+def finish_pending_ig_scan() -> bool:
+    """Run a deferred Instagram scan after the sit-tight bubble is on screen."""
+    handle = normalize_handle(st.session_state.get("_ig_scan_handle") or "")
+    if not handle:
+        return False
+    with st.spinner(random.choice(["Thinking…", "Loading…", "Building…", "Scanning the sky for UFOs…"])):
+        try:
+            _ig_scan_and_signup(handle)
+        finally:
+            st.session_state.pop("_ig_scan_handle", None)
+    return True
+
+
 def handle_need_ig(text: str) -> None:
     raw = (text or "").strip()
 
@@ -6368,11 +6524,6 @@ def handle_need_ig(text: str) -> None:
         append_assistant(guest_tennis_story_reply(text, remind_ig=True))
         return
 
-    if handle not in ADMIN_HANDLES and _indown_lookup(handle).get("missing"):
-        drop_unfinished_handle(handle)
-        _tell_profile_missing(at)
-        return
-
     ensure_pending_handle(handle)
     existing = get_user_by_handle(handle)
 
@@ -6394,172 +6545,43 @@ def handle_need_ig(text: str) -> None:
         )
         return
 
-    # Incomplete signup — resume PIN; re-evaluate if previously gated or demographics thin
+    # Incomplete signup — resume PIN only when we already have a solid assignment
     if existing and not existing.get("pin_hash") and existing.get("animal"):
         was_gated = existing.get("ai_enabled") is not None and not int(existing.get("ai_enabled") or 0)
         g0 = (existing.get("gender") or "").strip().lower()
         n0 = (existing.get("nationality") or "").strip().lower()
         thin_demo = (not g0 or g0 == "unknown") or (not n0 or n0 == "unknown")
         empty_why = not (existing.get("assign_why") or "").strip()
-        if (was_gated or thin_demo or empty_why) and not is_admin(existing):
-            with st.spinner(f"Checking {at}…"):
-                resolved = resolve_member_profile(handle)
-                scrape = resolved["scrape"]
-                if scrape.get("profile_missing") and handle not in ADMIN_HANDLES:
-                    drop_unfinished_handle(handle)
-                    _tell_profile_missing(at)
-                    return
-                if not _profile_card_seen(scrape) and handle not in ADMIN_HANDLES:
-                    if not existing.get("ig_photo_path") and handle not in ADMIN_HANDLES:
-                        drop_unfinished_handle(handle)
-                        _tell_profile_unreadable(at)
-                        return
-                else:
-                    scraped_text = scrape.get("text") or f"instagram_handle:{handle}"
-                    ig_photo = scrape.get("ig_photo_path") or existing.get("ig_photo_path") or ""
-                    demo = resolved["demo"]
-                    if (demo.get("nationality") or "unknown") == "unknown":
-                        fn = (demo.get("first_name") or "").lower().replace(" ", "")
-                        toks = set(_handle_name_tokens(handle))
-                        if (
-                            fn in _FEM_GIVEN
-                            or "yee" in fn
-                            or "manyee" in handle.lower()
-                            or any(t in _FEM_GIVEN or t in _CJK_SURNAMES for t in toks)
-                        ):
-                            demo["nationality"] = "Hong Kong"
-                    eligible, gate_detail = settle_gate(handle, demo)
-                    if eligible:
-                        display_name, vibe, emoji, mascot, avatar_path = assign_animal_and_vibe(
-                            handle, scraped_text, scrape=scrape
-                        )
-                        ai_flag = 1
-                        assign_why = (scrape or {}).get("assign_why") or ""
-                    else:
-                        display_name, vibe, emoji, mascot, avatar_path = assign_club_tennis()
-                        ai_flag = 0
-                        assign_why = "Club tennis ball — the gate kept them out, so they did not get a matched animal."
-                    upsert_pending_user(
-                        handle,
-                        display_name,
-                        vibe,
-                        emoji,
-                        mascot=mascot,
-                        avatar_path=avatar_path,
-                        ig_photo_path=ig_photo,
-                        gender=demo.get("gender") or "",
-                        nationality=demo.get("nationality") or "",
-                        age_guess=demo.get("age_guess") or "",
-                        ai_enabled=ai_flag,
-                        gate_detail=gate_detail,
-                        assign_why=assign_why,
-                    )
-                    _begin_pin_signup(
-                        handle,
-                        display_name,
-                        vibe,
-                        emoji,
-                        mascot,
-                        avatar_path,
-                        ig_photo,
-                        demo,
-                        scrape,
-                        bool(eligible),
-                    )
-                    return
-
-        mascot = existing.get("mascot") or existing.get("animal") or handle
-        animal_raw = existing.get("animal") or mascot
-        display_name = mascot if not re.search(r"[A-Za-z\u4e00-\u9fff]", animal_raw or "") else animal_raw
-        emoji = existing.get("animal_emoji") or "🎾"
-        avatar_path = existing.get("avatar_path") or ""
-        ig_photo = existing.get("ig_photo_path") or ""
-        ig_photo = ensure_ig_profile_photo(handle, ig_photo) or ig_photo
-        st.session_state.pending_handle = handle
-        st.session_state.pending_animal = display_name
-        st.session_state.pending_vibe = existing.get("vibe") or ""
-        st.session_state.pending_emoji = emoji
-        st.session_state.pending_mascot = mascot
-        st.session_state.pending_avatar = avatar_path
-        st.session_state.pending_ig_photo = ig_photo
-        st.session_state.auth_state = NEED_PIN_SIGNUP
-        if was_gated:
-            _lock_handle_session(handle)
-        photo_path = animal_photo_path(mascot, avatar_path)
-        append_assistant(
-            f"Welcome back mid-signup, {at} — you’re still **{display_name}** {emoji}\n\n"
-            "Set your **4-digit PIN** to finish (no IG re-scan).",
-            image=photo_path if isinstance(photo_path, str) and os.path.isfile(photo_path) else None,
-        )
-        return
-
-    # Brand-new account
-    with st.spinner(f"Checking {at}…"):
-        resolved = resolve_member_profile(handle)
-        scrape = resolved["scrape"]
-        if scrape.get("profile_missing") and handle not in ADMIN_HANDLES:
-            drop_unfinished_handle(handle)
-            _tell_profile_missing(at)
-            return
-        if not _profile_card_seen(scrape) and handle not in ADMIN_HANDLES:
-            drop_unfinished_handle(handle)
-            _tell_profile_unreadable(at)
-            return
-        scraped_text = scrape.get("text") or f"instagram_handle:{handle}"
-        ig_photo = scrape.get("ig_photo_path") or ""
-        demo = resolved["demo"]
-        if (demo.get("nationality") or "unknown") == "unknown":
-            fn = (demo.get("first_name") or "").lower().replace(" ", "")
-            toks = set(_handle_name_tokens(handle))
-            if (
-                fn in _FEM_GIVEN
-                or "yee" in fn
-                or "manyee" in handle.lower()
-                or any(t in _FEM_GIVEN or t in _CJK_SURNAMES for t in toks)
-            ):
-                demo["nationality"] = "Hong Kong"
-                demo["evidence"] = (demo.get("evidence") or "") + "; Cantonese name prior → Hong Kong"
-
-        eligible, gate_detail = settle_gate(handle, demo)
-        if eligible:
-            display_name, vibe, emoji, mascot, avatar_path = assign_animal_and_vibe(
-                handle, scraped_text, scrape=scrape
+        needs_rescan = (was_gated or thin_demo or empty_why) and not is_admin(existing)
+        if not needs_rescan:
+            mascot = existing.get("mascot") or existing.get("animal") or handle
+            animal_raw = existing.get("animal") or mascot
+            display_name = mascot if not re.search(r"[A-Za-z\u4e00-\u9fff]", animal_raw or "") else animal_raw
+            emoji = existing.get("animal_emoji") or "🎾"
+            avatar_path = existing.get("avatar_path") or ""
+            ig_photo = existing.get("ig_photo_path") or ""
+            ig_photo = ensure_ig_profile_photo(handle, ig_photo) or ig_photo
+            st.session_state.pending_handle = handle
+            st.session_state.pending_animal = display_name
+            st.session_state.pending_vibe = existing.get("vibe") or ""
+            st.session_state.pending_emoji = emoji
+            st.session_state.pending_mascot = mascot
+            st.session_state.pending_avatar = avatar_path
+            st.session_state.pending_ig_photo = ig_photo
+            st.session_state.auth_state = NEED_PIN_SIGNUP
+            if was_gated:
+                _lock_handle_session(handle)
+            photo_path = animal_photo_path(mascot, avatar_path)
+            append_assistant(
+                f"Welcome back mid-signup, {at} — you’re still **{display_name}** {emoji}\n\n"
+                "Set your **4-digit PIN** to finish (no IG re-scan).",
+                image=photo_path if isinstance(photo_path, str) and os.path.isfile(photo_path) else None,
             )
-            ai_flag = 1
-            assign_why = (scrape or {}).get("assign_why") or ""
-        else:
-            display_name, vibe, emoji, mascot, avatar_path = assign_club_tennis()
-            ai_flag = 0
-            assign_why = "Club tennis ball — the gate kept them out, so they did not get a matched animal."
+            return
 
-        upsert_pending_user(
-            handle,
-            display_name,
-            vibe,
-            emoji,
-            mascot=mascot,
-            avatar_path=avatar_path,
-            ig_photo_path=ig_photo,
-            gender=demo.get("gender") or "",
-            nationality=demo.get("nationality") or "",
-            age_guess=demo.get("age_guess") or "",
-            ai_enabled=ai_flag,
-            gate_detail=gate_detail,
-            assign_why=assign_why,
-        )
-
-    _begin_pin_signup(
-        handle,
-        display_name,
-        vibe,
-        emoji,
-        mascot,
-        avatar_path,
-        ig_photo,
-        demo,
-        scrape,
-        bool(eligible),
-    )
+    # Brand-new or incomplete re-scan — show sit-tight first, finish on next run
+    st.session_state["_ig_scan_handle"] = handle
+    append_assistant(_sit_tight_line(at))
 
 
 def handle_need_pin_signup(text: str) -> None:
@@ -6803,7 +6825,12 @@ def placeholder_for_state() -> str:
 
 
 def main() -> None:
-    st.set_page_config(page_title="playplaytennis", page_icon="🎾", layout="centered")
+    st.set_page_config(
+        page_title="playplaytennis",
+        page_icon="🎾",
+        layout="centered",
+        menu_items={"Get help": None, "Report a bug": None, "About": None},
+    )
     init_db()
     ensure_session()
     inject_styles()
@@ -6822,6 +6849,9 @@ def main() -> None:
 
     bootstrap_greeting()
     render_messages()
+
+    if finish_pending_ig_scan():
+        st.rerun()
 
     prompt = st.chat_input(placeholder_for_state())
     if prompt:
