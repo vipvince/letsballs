@@ -753,6 +753,67 @@ def games_as_context() -> str:
     return "Scheduled games:\n" + "\n".join(lines)
 
 
+def list_game_signups() -> list[dict]:
+    """Games with the Instagram handles that held a spot, newest game first."""
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_signups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id INTEGER NOT NULL,
+                ig_handle TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(game_id, ig_handle)
+            )
+            """
+        )
+        games = conn.execute(
+            """
+            SELECT id, when_text, location, spots, notes
+            FROM games
+            ORDER BY id DESC
+            """
+        ).fetchall()
+        out: list[dict] = []
+        for g in games:
+            rows = conn.execute(
+                """
+                SELECT ig_handle, created_at
+                FROM game_signups
+                WHERE game_id = ?
+                ORDER BY id ASC
+                """,
+                (g["id"],),
+            ).fetchall()
+            out.append(
+                {
+                    **dict(g),
+                    "signups": [dict(r) for r in rows],
+                }
+            )
+    return out
+
+
+def signups_as_context() -> str:
+    games = list_game_signups()
+    if not games:
+        return "No games are currently scheduled."
+    blocks: list[str] = []
+    for g in games:
+        loc = g.get("location") or DEFAULT_GAME_LOCATION
+        people = g.get("signups") or []
+        header = (
+            f"**#{g['id']}** {g['when_text']} @ {loc} — "
+            f"{len(people)} registered · {g['spots']} spots left"
+        )
+        if not people:
+            blocks.append(f"{header}\n- (nobody yet)")
+            continue
+        names = "\n".join(f"- @{s['ig_handle']}" for s in people)
+        blocks.append(f"{header}\n{names}")
+    return "**Game signups**\n\n" + "\n\n".join(blocks)
+
+
 def maybe_game_invite(reply: str = "") -> str:
     """Sometimes append a soft invite to an upcoming game for eligible members."""
     games = [g for g in list_games() if int(g.get("spots") or 0) > 0]
@@ -1007,8 +1068,10 @@ def admin_help_text() -> str:
         "   Sets a new 4-digit PIN.\n"
         "6. **Board** — `games`\n"
         "   List upcoming games.\n"
-        "7. **Help** — `help` or `/help`\n"
-        "8. **Log out** — `logout`"
+        "7. **Signups** — `signups`\n"
+        "   Who registered for each game (@handles).\n"
+        "8. **Help** — `help` or `/help`\n"
+        "9. **Log out** — `logout`"
     )
 
 
@@ -1021,6 +1084,18 @@ def try_admin_command(text: str) -> bool:
         return True
     if lower in {"games", "/games", "list games", "upcoming", "upcoming games"}:
         append_assistant(games_as_context())
+        return True
+    if lower in {
+        "signups",
+        "/signups",
+        "who signed up",
+        "registrations",
+        "players",
+        "who’s in",
+        "who's in",
+        "whos in",
+    }:
+        append_assistant(signups_as_context())
         return True
     who = re.fullmatch(r"(?:/)?(?:user|who|info|details)\s+@?([A-Za-z0-9._]{2,30})", raw, re.I)
     if who:
