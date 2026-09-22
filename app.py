@@ -1112,6 +1112,38 @@ def format_user_admin(user: dict) -> str:
     )
 
 
+def list_users(limit: int = 80) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT ig_handle, mascot, animal, animal_emoji, pin_hash,
+                   ai_enabled, gender, age_guess, nationality
+            FROM users
+            ORDER BY lower(ig_handle) ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def users_as_context() -> str:
+    users = list_users()
+    if not users:
+        return "No members in the database yet."
+    lines: list[str] = []
+    for u in users:
+        handle = u.get("ig_handle") or "?"
+        character = u.get("mascot") or u.get("animal") or "—"
+        emoji = (u.get("animal_emoji") or "").strip()
+        pin = "PIN" if u.get("pin_hash") else "no PIN"
+        gate = "in" if user_ai_enabled(u) else "out"
+        admin = " · admin" if normalize_handle(handle) in ADMIN_HANDLES else ""
+        who = f"{character} {emoji}".strip()
+        lines.append(f"- @{handle}{admin} — {who} · gate {gate} · {pin}")
+    return f"**Members ({len(users)})**\n\n" + "\n".join(lines)
+
+
 def maybe_lucky_in(ig_handle: str, eligible: bool) -> bool:
     """Failed automatic gate still gets in 25% of the time. Admin locks are final."""
     if eligible:
@@ -1144,16 +1176,18 @@ def admin_help_text() -> str:
         "   Tennis stories only. No club chat.\n"
         "4. **User** — `user @handle`\n"
         "   Profile, why they are gated in or out (including the 25% roll), and why that character.\n"
-        "5. **Reset PIN** — `reset pin @handle 4821`\n"
+        "5. **List users** — `list users` or `users`\n"
+        "   All members with gate / character / PIN status.\n"
+        "6. **Reset PIN** — `reset pin @handle 4821`\n"
         "   Sets a new 4-digit PIN.\n"
-        "6. **Board** — `games`\n"
+        "7. **Board** — `games`\n"
         "   List upcoming games.\n"
-        "7. **Signups** — `signups`\n"
+        "8. **Signups** — `signups`\n"
         "   Who registered for each game (@handles).\n"
-        "8. **Remove** — `remove @handle` or `remove @handle from #3`\n"
+        "9. **Remove** — `remove @handle` or `remove @handle from #3`\n"
         "   Drop them from a game and put the spot back.\n"
-        "9. **Help** — `help` or `/help`\n"
-        "10. **Log out** — `logout`"
+        "10. **Help** — `help` or `/help`\n"
+        "11. **Log out** — `logout`"
     )
 
 
@@ -1166,6 +1200,17 @@ def try_admin_command(text: str) -> bool:
         return True
     if lower in {"games", "/games", "list games", "upcoming", "upcoming games"}:
         append_assistant(games_as_context())
+        return True
+    if lower in {
+        "users",
+        "/users",
+        "list users",
+        "list user",
+        "list members",
+        "members",
+        "who",
+    }:
+        append_assistant(users_as_context())
         return True
     if lower in {
         "signups",
@@ -6971,6 +7016,13 @@ def handle_logged_in(text: str) -> None:
         f"{games_as_context()}\n"
         f"{game_rule}"
     )
+    if is_admin(user):
+        extra += (
+            "\nThis sender is a club admin. Never say you lack admin access. "
+            "For member lists, signups, gates, or PIN resets, tell them to type "
+            "`help` for the exact admin commands (e.g. `list users`, `signups`, "
+            "`user @handle`)."
+        )
     history: list[dict[str, str]] = []
     for msg in st.session_state.messages[-10:]:
         if msg["role"] in ("user", "assistant"):
