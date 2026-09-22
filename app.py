@@ -12,6 +12,8 @@ import os
 import random
 import re
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from typing import Any, Optional
 from urllib.parse import quote_plus
@@ -277,7 +279,7 @@ CLUB_TENNIS_FILE = "club_tennis.png"
 CLUB_TENNIS_LABEL = "club tennis"
 CLUB_TENNIS_EMOJI = "🎾"
 
-# AI club chat: women under 40 in HK / Taiwan / China / Japan / Korea
+# AI club chat: women clearly under 40 (nationality is not a gate)
 _ALLOWED_NAT_KEYS = (
     "hong kong", "hk", "hkg", "taiwan", "taiwanese", "china", "chinese",
     "chinese-speaking", "japan", "japanese", "korea", "korean", "south korea",
@@ -814,6 +816,84 @@ def signups_as_context() -> str:
     return "**Game signups**\n\n" + "\n\n".join(blocks)
 
 
+def remove_game_signup(ig_handle: str, game_id: Optional[int] = None) -> tuple[str, dict]:
+    """
+    Drop a member from a game and put the spot back.
+    Returns ('removed'|'not_found'|'none', game).
+    If game_id is None, remove from their newest signup.
+    """
+    handle = normalize_handle(ig_handle)
+    if not handle:
+        return "not_found", {}
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_signups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id INTEGER NOT NULL,
+                ig_handle TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(game_id, ig_handle)
+            )
+            """
+        )
+        if game_id is not None:
+            row = conn.execute(
+                """
+                SELECT s.id AS signup_id, g.id, g.when_text, g.location, g.spots
+                FROM game_signups s
+                JOIN games g ON g.id = s.game_id
+                WHERE s.ig_handle = ? AND s.game_id = ?
+                """,
+                (handle, int(game_id)),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT s.id AS signup_id, g.id, g.when_text, g.location, g.spots
+                FROM game_signups s
+                JOIN games g ON g.id = s.game_id
+                WHERE s.ig_handle = ?
+                ORDER BY s.id DESC
+                LIMIT 1
+                """,
+                (handle,),
+            ).fetchone()
+        if not row:
+            if game_id is not None:
+                return "not_found", {"id": int(game_id)}
+            any_games = conn.execute("SELECT id FROM games LIMIT 1").fetchone()
+            return ("none" if not any_games else "not_found"), {}
+        conn.execute("DELETE FROM game_signups WHERE id = ?", (row["signup_id"],))
+        conn.execute(
+            "UPDATE games SET spots = spots + 1 WHERE id = ?",
+            (row["id"],),
+        )
+        updated = conn.execute(
+            "SELECT id, when_text, location, spots FROM games WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+    return "removed", dict(updated) if updated else dict(row)
+
+
+def remove_signup_reply(status: str, handle: str, game: dict) -> str:
+    at = f"@{normalize_handle(handle)}"
+    when = (game or {}).get("when_text") or "that game"
+    loc = (game or {}).get("location") or DEFAULT_GAME_LOCATION
+    spots = (game or {}).get("spots")
+    if status == "none":
+        return "There is no game on the board right now."
+    if status == "not_found":
+        if game.get("id"):
+            return f"**{at}** is not registered for game **#{game['id']}**."
+        return f"**{at}** is not registered for any game."
+    spot_bit = f" · **{spots}** spots left" if spots is not None else ""
+    return (
+        f"Removed **{at}** from **{when}** @ {loc}. "
+        f"Spot is back on the board{spot_bit}."
+    )
+
+
 def maybe_game_invite(reply: str = "") -> str:
     """Sometimes append a soft invite to an upcoming game for eligible members."""
     games = [g for g in list_games() if int(g.get("spots") or 0) > 0]
@@ -1070,8 +1150,10 @@ def admin_help_text() -> str:
         "   List upcoming games.\n"
         "7. **Signups** — `signups`\n"
         "   Who registered for each game (@handles).\n"
-        "8. **Help** — `help` or `/help`\n"
-        "9. **Log out** — `logout`"
+        "8. **Remove** — `remove @handle` or `remove @handle from #3`\n"
+        "   Drop them from a game and put the spot back.\n"
+        "9. **Help** — `help` or `/help`\n"
+        "10. **Log out** — `logout`"
     )
 
 
@@ -1096,6 +1178,18 @@ def try_admin_command(text: str) -> bool:
         "whos in",
     }:
         append_assistant(signups_as_context())
+        return True
+    drop = re.fullmatch(
+        r"(?:/)?(?:remove|drop|unbook)\s+@?([A-Za-z0-9._]{2,30})"
+        r"(?:\s+(?:from\s+)?(?:#|game\s*)?(\d+))?",
+        raw,
+        re.I,
+    )
+    if drop:
+        handle = normalize_handle(drop.group(1))
+        gid = int(drop.group(2)) if drop.group(2) else None
+        status, game = remove_game_signup(handle, gid)
+        append_assistant(remove_signup_reply(status, handle, game))
         return True
     who = re.fullmatch(r"(?:/)?(?:user|who|info|details)\s+@?([A-Za-z0-9._]{2,30})", raw, re.I)
     if who:
@@ -5194,32 +5288,25 @@ def _age_under_forty(age_guess: str) -> bool:
 
 def club_ai_eligible(demo: dict[str, str]) -> tuple[bool, str]:
     """
-    In only when all three hold:
-      female, age clearly under 40, nationality HK / Taiwan / China / Japan / Korea.
-    Unknown gender, age, or nationality is gated.
+    In only when both hold: female, and age clearly under 40.
+    Unknown gender or age is gated. Nationality is not a gate.
     """
     gender = (demo.get("gender") or "").strip().lower()
     if gender != "female":
         return False, "gender"
     if not _age_under_forty(demo.get("age_guess") or ""):
         return False, "age"
-    if not _nationality_allowed(demo.get("nationality") or ""):
-        return False, "nationality"
     return True, ""
 
 
 def _gate_check_lines(demo: dict[str, str]) -> str:
     gender = (demo.get("gender") or "unknown").strip() or "unknown"
     age = (demo.get("age_guess") or "unknown").strip() or "unknown"
-    nat = (demo.get("nationality") or "unknown").strip() or "unknown"
     g_ok = gender.lower() == "female"
     a_ok = _age_under_forty(age)
-    n_ok = _nationality_allowed(nat)
     return (
         f"- Gender: {gender} — {'pass' if g_ok else 'fail (need female)'}\n"
-        f"- Age: {age} — {'pass' if a_ok else 'fail (need clearly under 40)'}\n"
-        f"- Nationality: {nat} — "
-        f"{'pass' if n_ok else 'fail (need Hong Kong, Taiwan, China, Japan, or Korea)'}"
+        f"- Age: {age} — {'pass' if a_ok else 'fail (need clearly under 40)'}"
     )
 
 
@@ -5235,7 +5322,6 @@ def describe_gate(
     fails = {
         "gender": "gender is not female",
         "age": "age is not clearly under 40",
-        "nationality": "nationality is outside Hong Kong, Taiwan, China, Japan, and Korea",
     }
     fail = fails.get(auto_reason or "", auto_reason or "a check failed")
     if override is True:
@@ -5243,7 +5329,7 @@ def describe_gate(
     elif override is False:
         head = "Admin forced them out. The 25% roll does not apply."
     elif auto_ok and final_ok:
-        head = "Gated in. Gender, age, and nationality all passed."
+        head = "Gated in. Gender and age both passed."
     elif (not auto_ok) and final_ok:
         head = f"Automatic gate was out ({fail}). Let in on the 25% roll."
     elif not auto_ok:
@@ -5281,7 +5367,7 @@ def gate_story_for_admin(user: dict) -> str:
     }
     if not any(v.strip() for v in demo.values()):
         stored = (user.get("gate_detail") or "").strip()
-        return stored or "No gender, age, or nationality saved yet."
+        return stored or "No gender or age saved yet."
     auto_ok, auto_reason = club_ai_eligible(demo)
     raw = user.get("gate_override")
     override = None if raw is None else bool(int(raw))
@@ -6438,7 +6524,7 @@ def _sit_tight_line(at: str) -> str:
             "Hold that serve — still loading.",
             "Warming up the ball machine…",
             "One moment. Counting tennis balls.",
-            "Don’t bounce yet — almost there.",
+            "Don’t bounce yet — loading.",
         ]
     )
 
@@ -6559,11 +6645,44 @@ def finish_pending_ig_scan() -> bool:
     handle = normalize_handle(st.session_state.get("_ig_scan_handle") or "")
     if not handle:
         return False
-    with st.spinner(random.choice(["Thinking…", "Loading…", "Building…", "Scanning the sky for UFOs…"])):
+
+    done = {"ok": False}
+    err: dict[str, BaseException | None] = {"e": None}
+
+    def _work() -> None:
         try:
             _ig_scan_and_signup(handle)
+        except BaseException as exc:  # noqa: BLE001 — surface after wait loop
+            err["e"] = exc
         finally:
-            st.session_state.pop("_ig_scan_handle", None)
+            done["ok"] = True
+
+    worker = threading.Thread(target=_work, daemon=True)
+    worker.start()
+
+    bar = st.progress(5, text="Loading… 5%")
+    t0 = time.time()
+    almost_lines = (
+        "Almost there…",
+        "Hang tight — finishing up…",
+        "Nearly done…",
+        "Last stretch…",
+    )
+    try:
+        while not done["ok"]:
+            elapsed = time.time() - t0
+            pct = min(92, max(5, int(5 + elapsed * 2.8)))
+            if elapsed >= 15:
+                bar.progress(pct, text=f"{random.choice(almost_lines)} {pct}%")
+            else:
+                bar.progress(pct, text=f"Loading… {pct}%")
+            time.sleep(1.2)
+        worker.join(timeout=2)
+        if err["e"] is not None:
+            raise err["e"]
+    finally:
+        bar.empty()
+        st.session_state.pop("_ig_scan_handle", None)
     return True
 
 
@@ -6624,8 +6743,8 @@ def handle_need_ig(text: str) -> None:
     if existing and not existing.get("pin_hash") and existing.get("animal"):
         was_gated = existing.get("ai_enabled") is not None and not int(existing.get("ai_enabled") or 0)
         g0 = (existing.get("gender") or "").strip().lower()
-        n0 = (existing.get("nationality") or "").strip().lower()
-        thin_demo = (not g0 or g0 == "unknown") or (not n0 or n0 == "unknown")
+        a0 = (existing.get("age_guess") or "").strip().lower()
+        thin_demo = (not g0 or g0 == "unknown") or (not a0 or a0 in {"unknown", "n/a", "na", "?"})
         empty_why = not (existing.get("assign_why") or "").strip()
         needs_rescan = (was_gated or thin_demo or empty_why) and not is_admin(existing)
         if not needs_rescan:
