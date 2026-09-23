@@ -468,6 +468,59 @@ def _dict_row_factory(cursor, row):
     return {col[0]: row[i] for i, col in enumerate(cursor.description)}
 
 
+def _as_dict(row) -> dict:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except Exception:
+        pass
+    if isinstance(row, (tuple, list)):
+        # libsql sometimes returns bare tuples for single-column SELECTs
+        if len(row) == 1:
+            return {"id": row[0]}
+        return {"id": row[0]} if row else {}
+    return {}
+
+
+def _fetchone_dict(cursor) -> Optional[dict]:
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except Exception:
+        pass
+    desc = getattr(cursor, "description", None)
+    if desc and isinstance(row, (tuple, list)):
+        return {col[0]: row[i] for i, col in enumerate(desc)}
+    return _as_dict(row)
+
+
+def _fetchall_dicts(cursor) -> list[dict]:
+    rows = cursor.fetchall() or []
+    out: list[dict] = []
+    desc = getattr(cursor, "description", None)
+    for row in rows:
+        if isinstance(row, dict):
+            out.append(dict(row))
+            continue
+        try:
+            out.append(dict(row))
+            continue
+        except Exception:
+            pass
+        if desc and isinstance(row, (tuple, list)):
+            out.append({col[0]: row[i] for i, col in enumerate(desc)})
+        else:
+            out.append(_as_dict(row))
+    return out
+
+
 def _open_db_connection():
     """
     Prefer Turso when secrets exist (survives Streamlit Cloud reboots).
@@ -478,26 +531,31 @@ def _open_db_connection():
         try:
             import libsql
 
-            # Embedded replica: SQLite-compatible API + cloud primary
-            conn = libsql.connect(
-                TURSO_LOCAL_PATH,
-                sync_url=url,
-                auth_token=token,
-            )
-            try:
-                conn.sync()
-            except Exception:
-                pass
+            # Remote-only — Streamlit Cloud /mount/src is often read-only,
+            # so embedded replica files under the app dir can fail.
+            conn = libsql.connect(database=url, auth_token=token)
             if hasattr(conn, "row_factory"):
-                conn.row_factory = _dict_row_factory
+                try:
+                    conn.row_factory = _dict_row_factory
+                except Exception:
+                    pass
             return conn, True
         except Exception:
             try:
                 import libsql
+                import tempfile
 
-                conn = libsql.connect(database=url, auth_token=token)
+                local = os.path.join(tempfile.gettempdir(), "letsballs_tennis_turso.db")
+                conn = libsql.connect(local, sync_url=url, auth_token=token)
+                try:
+                    conn.sync()
+                except Exception:
+                    pass
                 if hasattr(conn, "row_factory"):
-                    conn.row_factory = _dict_row_factory
+                    try:
+                        conn.row_factory = _dict_row_factory
+                    except Exception:
+                        pass
                 return conn, True
             except Exception:
                 pass
@@ -516,9 +574,96 @@ def _run_script(conn, script: str) -> None:
             conn.execute(stmt)
 
 
+def _db_execute(conn, sql: str, params: Optional[tuple | list] = None):
+    """libsql prefers list params; sqlite3 accepts tuples."""
+    if params is None:
+        return conn.execute(sql)
+    try:
+        return conn.execute(sql, params)
+    except TypeError:
+        return conn.execute(sql, list(params))
+
+
+class _CompatCursor:
+    """Normalize libsql/sqlite rows to plain dicts."""
+
+    def __init__(self, cur):
+        self._cur = cur
+        self.description = getattr(cur, "description", None)
+        self.rowcount = getattr(cur, "rowcount", -1)
+        self.lastrowid = getattr(cur, "lastrowid", None)
+
+    def _to_dict(self, row):
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return dict(row)
+        try:
+            return dict(row)
+        except Exception:
+            pass
+        desc = self.description or getattr(self._cur, "description", None)
+        if desc and isinstance(row, (tuple, list)):
+            return {col[0]: row[i] for i, col in enumerate(desc)}
+        return _as_dict(row)
+
+    def fetchone(self):
+        return self._to_dict(self._cur.fetchone())
+
+    def fetchall(self):
+        rows = self._cur.fetchall() or []
+        return [self._to_dict(r) for r in rows]
+
+    def __iter__(self):
+        for row in self._cur:
+            yield self._to_dict(row)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class _CompatConn:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        cur = _db_execute(self._conn, sql, params)
+        # refresh description after execute
+        wrapped = _CompatCursor(cur)
+        wrapped.description = getattr(cur, "description", None)
+        wrapped.rowcount = getattr(cur, "rowcount", -1)
+        wrapped.lastrowid = getattr(cur, "lastrowid", None)
+        return wrapped
+
+    def executemany(self, sql, seq):
+        return self._conn.executemany(sql, seq)
+
+    def executescript(self, script):
+        return _run_script(self._conn, script)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+    def sync(self):
+        if hasattr(self._conn, "sync"):
+            return self._conn.sync()
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 @contextmanager
 def get_conn():
     conn, durable = _open_db_connection()
+    if durable and not isinstance(conn, _CompatConn):
+        conn = _CompatConn(conn)
     try:
         yield conn
         conn.commit()
@@ -538,17 +683,6 @@ def get_conn():
             conn.close()
         except Exception:
             pass
-
-
-def _as_dict(row) -> dict:
-    if row is None:
-        return {}
-    if isinstance(row, dict):
-        return dict(row)
-    try:
-        return dict(row)
-    except Exception:
-        return {}
 
 
 def _pragma_signup_cols(conn) -> set[str]:
@@ -657,21 +791,25 @@ def seed_admin_user() -> None:
     emoji = TENNIS_ANIMALS.get(animal) or "🐕"
     avatar_path = "surf_dog.png"
     with get_conn() as conn:
-        old = conn.execute(
-            "SELECT id FROM users WHERE lower(ig_handle) = ?",
-            ("vipstarbucks",),
-        ).fetchone()
-        row = conn.execute(
-            "SELECT id FROM users WHERE lower(ig_handle) = ?",
-            (handle,),
-        ).fetchone()
-        if old and not row:
+        old = _as_dict(
+            conn.execute(
+                "SELECT id FROM users WHERE lower(ig_handle) = ?",
+                ("vipstarbucks",),
+            ).fetchone()
+        )
+        row = _as_dict(
+            conn.execute(
+                "SELECT id FROM users WHERE lower(ig_handle) = ?",
+                (handle,),
+            ).fetchone()
+        )
+        if old.get("id") is not None and row.get("id") is None:
             conn.execute(
                 "UPDATE users SET ig_handle = ? WHERE id = ?",
                 (handle, old["id"]),
             )
             row = old
-        if row:
+        if row.get("id") is not None:
             conn.execute(
                 """
                 UPDATE users
