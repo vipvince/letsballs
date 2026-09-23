@@ -591,48 +591,69 @@ def _fetchall_dicts(cursor) -> list[dict]:
     return out
 
 
+def _open_sqlite_local():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@st.cache_resource(show_spinner=False)
+def _turso_shared() -> Optional[dict[str, Any]]:
+    """
+    One long-lived Turso connection for the Streamlit process.
+    Prefer an embedded replica under /tmp (fast local reads); fall back to remote.
+    """
+    url, token = turso_creds()
+    if not (url and token):
+        return None
+    try:
+        import libsql
+        import tempfile
+
+        local = os.path.join(tempfile.gettempdir(), "letsballs_tennis_turso.db")
+        conn = libsql.connect(local, sync_url=url, auth_token=token)
+        try:
+            conn.sync()
+        except Exception:
+            pass
+        if hasattr(conn, "row_factory"):
+            try:
+                conn.row_factory = _dict_row_factory
+            except Exception:
+                pass
+        return {"conn": conn, "mode": "embedded", "dirty": False, "last_sync": time.time()}
+    except Exception:
+        pass
+    try:
+        import libsql
+
+        conn = libsql.connect(database=url, auth_token=token)
+        if hasattr(conn, "row_factory"):
+            try:
+                conn.row_factory = _dict_row_factory
+            except Exception:
+                pass
+        return {"conn": conn, "mode": "remote", "dirty": False, "last_sync": time.time()}
+    except Exception:
+        return None
+
+
 def _open_db_connection():
     """
     Prefer Turso when secrets exist (survives Streamlit Cloud reboots).
     Otherwise use local tennis.db (fine on your PC; ephemeral on Cloud).
+    Returns (conn, durable, shared).
     """
-    url, token = turso_creds()
-    if url and token:
-        try:
-            import libsql
+    shared = _turso_shared()
+    if shared and shared.get("conn") is not None:
+        return shared["conn"], True, shared
+    return _open_sqlite_local(), False, None
 
-            # Remote-only — Streamlit Cloud /mount/src is often read-only,
-            # so embedded replica files under the app dir can fail.
-            conn = libsql.connect(database=url, auth_token=token)
-            if hasattr(conn, "row_factory"):
-                try:
-                    conn.row_factory = _dict_row_factory
-                except Exception:
-                    pass
-            return conn, True
-        except Exception:
-            try:
-                import libsql
-                import tempfile
 
-                local = os.path.join(tempfile.gettempdir(), "letsballs_tennis_turso.db")
-                conn = libsql.connect(local, sync_url=url, auth_token=token)
-                try:
-                    conn.sync()
-                except Exception:
-                    pass
-                if hasattr(conn, "row_factory"):
-                    try:
-                        conn.row_factory = _dict_row_factory
-                    except Exception:
-                        pass
-                return conn, True
-            except Exception:
-                pass
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn, False
-
+_WRITE_SQL_RE = re.compile(
+    r"^\s*(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE|DROP|VACUUM)\b",
+    re.I,
+)
 
 def _run_script(conn, script: str) -> None:
     if hasattr(conn, "executescript"):
@@ -657,8 +678,9 @@ def _db_execute(conn, sql: str, params: Optional[tuple | list] = None):
 class _CompatCursor:
     """Normalize libsql/sqlite rows to plain dicts."""
 
-    def __init__(self, cur):
+    def __init__(self, cur, shared: Optional[dict[str, Any]] = None):
         self._cur = cur
+        self._shared = shared
         self.description = getattr(cur, "description", None)
         self.rowcount = getattr(cur, "rowcount", -1)
         self.lastrowid = getattr(cur, "lastrowid", None)
@@ -693,22 +715,29 @@ class _CompatCursor:
 
 
 class _CompatConn:
-    def __init__(self, conn):
+    def __init__(self, conn, shared: Optional[dict[str, Any]] = None):
         self._conn = conn
+        self._shared = shared
+
+    def _mark_write(self, sql: str) -> None:
+        if self._shared is not None and _WRITE_SQL_RE.match(sql or ""):
+            self._shared["dirty"] = True
 
     def execute(self, sql, params=None):
+        self._mark_write(sql if isinstance(sql, str) else "")
         cur = _db_execute(self._conn, sql, params)
-        # refresh description after execute
-        wrapped = _CompatCursor(cur)
+        wrapped = _CompatCursor(cur, self._shared)
         wrapped.description = getattr(cur, "description", None)
         wrapped.rowcount = getattr(cur, "rowcount", -1)
         wrapped.lastrowid = getattr(cur, "lastrowid", None)
         return wrapped
 
     def executemany(self, sql, seq):
+        self._mark_write(sql if isinstance(sql, str) else "")
         return self._conn.executemany(sql, seq)
 
     def executescript(self, script):
+        self._mark_write(script if isinstance(script, str) else "CREATE")
         return _run_script(self._conn, script)
 
     def commit(self):
@@ -718,6 +747,9 @@ class _CompatConn:
         return self._conn.rollback()
 
     def close(self):
+        # Shared Turso connections stay open for the process.
+        if self._shared is not None:
+            return None
         return self._conn.close()
 
     def sync(self):
@@ -731,17 +763,21 @@ class _CompatConn:
 
 @contextmanager
 def get_conn():
-    conn, durable = _open_db_connection()
+    conn, durable, shared = _open_db_connection()
     if durable and not isinstance(conn, _CompatConn):
-        conn = _CompatConn(conn)
+        conn = _CompatConn(conn, shared)
     try:
         yield conn
         conn.commit()
-        if durable and hasattr(conn, "sync"):
-            try:
-                conn.sync()
-            except Exception:
-                pass
+        # Sync Turso only after real writes (not every page read).
+        if durable and shared is not None and shared.get("dirty"):
+            if hasattr(conn, "sync"):
+                try:
+                    conn.sync()
+                except Exception:
+                    pass
+            shared["dirty"] = False
+            shared["last_sync"] = time.time()
     except Exception:
         try:
             conn.rollback()
@@ -755,23 +791,9 @@ def get_conn():
             pass
 
 
-def _pragma_signup_cols(conn) -> set[str]:
-    names = set()
-    for r in conn.execute("PRAGMA table_info(game_signups)").fetchall():
-        if isinstance(r, dict):
-            names.add(r.get("name") or "")
-        else:
-            names.add(r[1])
-    return {n for n in names if n}
-
-
-def format_handle(ig_handle: str) -> str:
-    """Always display handles with a leading @."""
-    h = normalize_handle(ig_handle)
-    return f"@{h}" if h else ""
-
-
-def init_db() -> None:
+@st.cache_resource(show_spinner=False)
+def _db_schema_ready() -> bool:
+    """Create tables / light migrations once per process — not every chat rerun."""
     os.makedirs(PROFILE_DIR, exist_ok=True)
     with get_conn() as conn:
         _run_script(
@@ -813,7 +835,7 @@ def init_db() -> None:
             );
             """,
         )
-        # Light migrations for older DBs
+
         def _col_names(pragma_rows):
             names = set()
             for r in pragma_rows:
@@ -850,6 +872,28 @@ def init_db() -> None:
                 "ALTER TABLE game_signups ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"
             )
     seed_admin_user()
+    return True
+
+
+def init_db() -> None:
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    _db_schema_ready()
+
+
+def _pragma_signup_cols(conn) -> set[str]:
+    names = set()
+    for r in conn.execute("PRAGMA table_info(game_signups)").fetchall():
+        if isinstance(r, dict):
+            names.add(r.get("name") or "")
+        else:
+            names.add(r[1])
+    return {n for n in names if n}
+
+
+def format_handle(ig_handle: str) -> str:
+    """Always display handles with a leading @."""
+    h = normalize_handle(ig_handle)
+    return f"@{h}" if h else ""
 
 
 def seed_admin_user() -> None:
@@ -860,6 +904,7 @@ def seed_admin_user() -> None:
     vibe = "Club captain energy — books the courts, then aces the banter."
     emoji = TENNIS_ANIMALS.get(animal) or "🐕"
     avatar_path = "surf_dog.png"
+    pin_h = hash_pin(pin)
     with get_conn() as conn:
         old = _as_dict(
             conn.execute(
@@ -869,7 +914,7 @@ def seed_admin_user() -> None:
         )
         row = _as_dict(
             conn.execute(
-                "SELECT id FROM users WHERE lower(ig_handle) = ?",
+                "SELECT id, pin_hash, animal, mascot, avatar_path FROM users WHERE lower(ig_handle) = ?",
                 (handle,),
             ).fetchone()
         )
@@ -878,8 +923,21 @@ def seed_admin_user() -> None:
                 "UPDATE users SET ig_handle = ? WHERE id = ?",
                 (handle, old["id"]),
             )
-            row = old
+            row = _as_dict(
+                conn.execute(
+                    "SELECT id, pin_hash, animal, mascot, avatar_path FROM users WHERE lower(ig_handle) = ?",
+                    (handle,),
+                ).fetchone()
+            )
         if row.get("id") is not None:
+            # Skip write if already seeded — avoids Turso sync on every cold start.
+            if (
+                row.get("pin_hash") == pin_h
+                and (row.get("animal") or "") == animal
+                and (row.get("mascot") or "") == animal
+                and (row.get("avatar_path") or "") == avatar_path
+            ):
+                return
             conn.execute(
                 """
                 UPDATE users
@@ -887,7 +945,7 @@ def seed_admin_user() -> None:
                     mascot = ?, avatar_path = ?, ai_enabled = 1
                 WHERE id = ?
                 """,
-                (hash_pin(pin), animal, vibe, emoji, animal, avatar_path, row["id"]),
+                (pin_h, animal, vibe, emoji, animal, avatar_path, row["id"]),
             )
         else:
             conn.execute(
@@ -897,7 +955,7 @@ def seed_admin_user() -> None:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 """,
-                (handle, hash_pin(pin), animal, vibe, emoji, animal, avatar_path),
+                (handle, pin_h, animal, vibe, emoji, animal, avatar_path),
             )
 
 
