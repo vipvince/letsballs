@@ -4215,6 +4215,8 @@ def format_scrape_report(handle: str, scrape: dict[str, Any]) -> str:
 # DeepSeek
 # ---------------------------------------------------------------------------
 
+_API_CACHE: dict[str, str] = {"model": "", "base": ""}
+
 
 def get_client() -> Optional[OpenAI]:
     # Always reload .env so Streamlit picks up key/base/model without a full OS env
@@ -4236,15 +4238,25 @@ def get_client() -> Optional[OpenAI]:
         pass
     if not key:
         return None
-    # Cache active model for create() callers
-    st.session_state["_api_model"] = model
-    st.session_state["_api_base"] = base
+    # Module cache works from worker threads; session_state may not.
+    _API_CACHE["model"] = model
+    _API_CACHE["base"] = base
+    try:
+        st.session_state["_api_model"] = model
+        st.session_state["_api_base"] = base
+    except Exception:
+        pass
     return OpenAI(api_key=key, base_url=base)
 
 
 def active_model() -> str:
+    try:
+        cached = st.session_state.get("_api_model")
+    except Exception:
+        cached = None
     return (
-        st.session_state.get("_api_model")
+        cached
+        or _API_CACHE.get("model")
         or os.environ.get("DEEPSEEK_MODEL")
         or DEEPSEEK_MODEL
     )
@@ -7387,13 +7399,15 @@ def _apply_hk_name_prior(handle: str, demo: dict) -> None:
         demo["evidence"] = (demo.get("evidence") or "") + "; Cantonese name prior → Hong Kong"
 
 
-def _ig_scan_and_signup(handle: str) -> None:
-    """Long Instagram lookup + gate + character. Call after a sit-tight message."""
+def _prepare_ig_signup(handle: str) -> dict[str, Any]:
+    """
+    Heavy Instagram / gate / character work. Safe to run off the main thread.
+    Must NOT touch st.session_state or Streamlit widgets.
+    """
     at = format_handle(handle)
     if handle not in ADMIN_HANDLES and _indown_lookup(handle).get("missing"):
         drop_unfinished_handle(handle)
-        _tell_profile_missing(at)
-        return
+        return {"action": "missing", "at": at}
 
     ensure_pending_handle(handle)
     existing = get_user_by_handle(handle)
@@ -7402,8 +7416,7 @@ def _ig_scan_and_signup(handle: str) -> None:
     scrape = resolved["scrape"]
     if scrape.get("profile_missing") and handle not in ADMIN_HANDLES:
         drop_unfinished_handle(handle)
-        _tell_profile_missing(at)
-        return
+        return {"action": "missing", "at": at}
 
     card_ok = _profile_card_seen(scrape) or handle in ADMIN_HANDLES
     if not card_ok:
@@ -7416,26 +7429,22 @@ def _ig_scan_and_signup(handle: str) -> None:
             emoji = existing.get("animal_emoji") or "🎾"
             avatar_path = existing.get("avatar_path") or ""
             ig_photo = existing.get("ig_photo_path") or ""
-            st.session_state.pending_handle = handle
-            st.session_state.pending_animal = display_name
-            st.session_state.pending_vibe = existing.get("vibe") or ""
-            st.session_state.pending_emoji = emoji
-            st.session_state.pending_mascot = mascot
-            st.session_state.pending_avatar = avatar_path
-            st.session_state.pending_ig_photo = ig_photo
-            st.session_state.auth_state = NEED_PIN_SIGNUP
-            if existing.get("ai_enabled") is not None and not int(existing.get("ai_enabled") or 0):
-                _lock_handle_session(handle)
-            photo_path = animal_photo_path(mascot, avatar_path)
-            append_assistant(
-                f"Welcome back mid-signup, {at} — you’re still **{display_name}** {emoji}\n\n"
-                "Set your **4-digit PIN** to finish (no IG re-scan).",
-                image=photo_path if isinstance(photo_path, str) and os.path.isfile(photo_path) else None,
-            )
-            return
+            return {
+                "action": "mid_signup",
+                "at": at,
+                "handle": handle,
+                "display_name": display_name,
+                "vibe": existing.get("vibe") or "",
+                "emoji": emoji,
+                "mascot": mascot,
+                "avatar_path": avatar_path,
+                "ig_photo": ig_photo,
+                "lock": bool(
+                    existing.get("ai_enabled") is not None and not int(existing.get("ai_enabled") or 0)
+                ),
+            }
         drop_unfinished_handle(handle)
-        _tell_profile_unreadable(at)
-        return
+        return {"action": "unreadable", "at": at}
 
     scraped_text = scrape.get("text") or f"instagram_handle:{handle}"
     ig_photo = scrape.get("ig_photo_path") or (existing or {}).get("ig_photo_path") or ""
@@ -7469,18 +7478,72 @@ def _ig_scan_and_signup(handle: str) -> None:
         gate_detail=gate_detail,
         assign_why=assign_why,
     )
-    _begin_pin_signup(
-        handle,
-        display_name,
-        vibe,
-        emoji,
-        mascot,
-        avatar_path,
-        ig_photo,
-        demo,
-        scrape,
-        bool(eligible),
-    )
+    return {
+        "action": "pin_signup",
+        "handle": handle,
+        "display_name": display_name,
+        "vibe": vibe,
+        "emoji": emoji,
+        "mascot": mascot,
+        "avatar_path": avatar_path,
+        "ig_photo": ig_photo,
+        "eligible": bool(eligible),
+    }
+
+
+def _apply_ig_signup(result: dict[str, Any]) -> None:
+    """Apply scan results on the main Streamlit thread only."""
+    action = result.get("action")
+    if action == "missing":
+        _tell_profile_missing(result.get("at") or "")
+        return
+    if action == "unreadable":
+        _tell_profile_unreadable(result.get("at") or "")
+        return
+    if action == "mid_signup":
+        handle = result["handle"]
+        display_name = result["display_name"]
+        emoji = result["emoji"]
+        mascot = result["mascot"]
+        avatar_path = result["avatar_path"]
+        at = result.get("at") or format_handle(handle)
+        st.session_state.pending_handle = handle
+        st.session_state.pending_animal = display_name
+        st.session_state.pending_vibe = result.get("vibe") or ""
+        st.session_state.pending_emoji = emoji
+        st.session_state.pending_mascot = mascot
+        st.session_state.pending_avatar = avatar_path
+        st.session_state.pending_ig_photo = result.get("ig_photo") or ""
+        st.session_state.auth_state = NEED_PIN_SIGNUP
+        if result.get("lock"):
+            _lock_handle_session(handle)
+        photo_path = animal_photo_path(mascot, avatar_path)
+        append_assistant(
+            f"Welcome back mid-signup, {at} — you’re still **{display_name}** {emoji}\n\n"
+            "Set your **4-digit PIN** to finish (no IG re-scan).",
+            image=photo_path if isinstance(photo_path, str) and os.path.isfile(photo_path) else None,
+        )
+        return
+    if action == "pin_signup":
+        _begin_pin_signup(
+            result["handle"],
+            result["display_name"],
+            result["vibe"],
+            result["emoji"],
+            result["mascot"],
+            result["avatar_path"],
+            result.get("ig_photo") or "",
+            {},
+            {},
+            bool(result.get("eligible")),
+        )
+        return
+    append_assistant("Something went sideways loading that profile. Try the handle again.")
+
+
+def _ig_scan_and_signup(handle: str) -> None:
+    """Main-thread convenience wrapper (tests / direct calls)."""
+    _apply_ig_signup(_prepare_ig_signup(handle))
 
 
 def finish_pending_ig_scan() -> bool:
@@ -7490,13 +7553,13 @@ def finish_pending_ig_scan() -> bool:
         return False
 
     done = {"ok": False}
-    err: dict[str, BaseException | None] = {"e": None}
+    box: dict[str, Any] = {"result": None, "error": None}
 
     def _work() -> None:
         try:
-            _ig_scan_and_signup(handle)
+            box["result"] = _prepare_ig_signup(handle)
         except BaseException as exc:  # noqa: BLE001 — surface after wait loop
-            err["e"] = exc
+            box["error"] = exc
         finally:
             done["ok"] = True
 
@@ -7521,11 +7584,18 @@ def finish_pending_ig_scan() -> bool:
                 bar.progress(pct, text=f"Loading… {pct}%")
             time.sleep(1.2)
         worker.join(timeout=2)
-        if err["e"] is not None:
-            raise err["e"]
     finally:
         bar.empty()
         st.session_state.pop("_ig_scan_handle", None)
+
+    if box["error"] is not None:
+        append_assistant(
+            "Couldn’t finish that Instagram look-up just now. "
+            "Try the handle again in a moment."
+        )
+        return True
+    if box["result"] is not None:
+        _apply_ig_signup(box["result"])
     return True
 
 
