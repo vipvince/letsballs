@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from urllib.parse import quote_plus
 
@@ -98,6 +99,75 @@ _GAME_DATE_RE = re.compile(
     r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?|"
     r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b",
     re.I,
+)
+
+_MONTH_NUM = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+_MONTH_LABEL = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sept",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+_WEEKDAY_NUM = {
+    "mon": 0,
+    "monday": 0,
+    "tue": 1,
+    "tues": 1,
+    "tuesday": 1,
+    "wed": 2,
+    "wednesday": 2,
+    "thu": 3,
+    "thur": 3,
+    "thurs": 3,
+    "thursday": 3,
+    "fri": 4,
+    "friday": 4,
+    "sat": 5,
+    "saturday": 5,
+    "sun": 6,
+    "sunday": 6,
+}
+_WEEKDAY_LABEL = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
 )
 
 # Common Cantonese / HK / Chinese surnames (romanized) — strong locale + name-order signal
@@ -1184,8 +1254,8 @@ def format_admin_signup_notices(rows: list[dict]) -> str:
         when = r.get("when_text") or "a game"
         loc = r.get("location") or DEFAULT_GAME_LOCATION
         lines.append(
-            f"- @{r.get('ig_handle')} joined **#{r.get('game_id')}** {when} @ {loc} "
-            f"({r.get('spots')} spots left)"
+            f"- @{r.get('ig_handle')} joined **#{r.get('game_id')}** "
+            f"{format_game_card(when, r.get('spots'), loc)}"
         )
     return "\n".join(lines)
 
@@ -1207,7 +1277,9 @@ def games_as_context() -> str:
     for g in games:
         loc = g.get("location") or DEFAULT_GAME_LOCATION
         notes = f" ({g['notes']})" if g.get("notes") else ""
-        lines.append(f"- #{g['id']}: {g['when_text']} @ {loc} — {g['spots']} spots{notes}")
+        lines.append(
+            f"- #{g['id']}: {format_game_card(g.get('when_text') or '', g.get('spots'), loc)}{notes}"
+        )
     return "Scheduled games (live from database):\n" + "\n".join(lines)
 
 
@@ -1261,8 +1333,8 @@ def signups_as_context() -> str:
         loc = g.get("location") or DEFAULT_GAME_LOCATION
         people = g.get("signups") or []
         header = (
-            f"**#{g['id']}** {g['when_text']} @ {loc} — "
-            f"{len(people)} registered · {g['spots']} spots left"
+            f"**#{g['id']}** {format_game_card(g.get('when_text') or '', g.get('spots'), loc)} — "
+            f"{len(people)} registered"
         )
         if not people:
             blocks.append(f"{header}\n- (nobody yet)")
@@ -1363,9 +1435,10 @@ def maybe_game_invite(reply: str = "") -> str:
         return ""
     g = games[0]
     loc = g.get("location") or DEFAULT_GAME_LOCATION
+    card = format_game_card(g.get("when_text") or "", g.get("spots"), loc)
     return (
-        f"\n\nWant in on **{g['when_text']}** @ {loc}? "
-        f"**{g['spots']}** spots left — say yes and I’ll hold one."
+        f"\n\nWant in on **{card}**? "
+        "Say yes and I’ll hold one."
     )
 
 
@@ -1632,8 +1705,8 @@ def character_reveal(name: str, emoji: str) -> str:
 def admin_help_text() -> str:
     return (
         "**Admin commands**\n\n"
-        "1. **Add a game** — `Add game Sat 3pm 4 spots`\n"
-        f"   Needs a date, a time, and spots. Location defaults to **{DEFAULT_GAME_LOCATION}**.\n"
+        "1. **Add a game** — `Add game Sat 5pm 3 spots`\n"
+        f"   Saved as **Sept 26 (Saturday) @ 5pm** style. Location defaults to **{DEFAULT_GAME_LOCATION}**.\n"
         "2. **Delete a game** — `delete game #3`\n"
         "   Removes the game and all its signups.\n"
         "3. **Add a user** — `add user @handle 4821`\n"
@@ -6101,6 +6174,188 @@ def deepseek_chat(messages: list[dict[str, str]], extra_system: str = "") -> str
     except Exception as exc:
         return format_api_error(exc) + "\n\n" + local_tennis_reply(last_user)
 
+def _month_from_token(token: str) -> Optional[int]:
+    key = re.sub(r"[^a-z]", "", (token or "").lower())
+    if not key:
+        return None
+    if key in _MONTH_NUM:
+        return _MONTH_NUM[key]
+    if key.startswith("sep"):
+        return 9
+    if key[:3] in _MONTH_NUM:
+        return _MONTH_NUM[key[:3]]
+    return None
+
+
+def _weekday_from_token(token: str) -> Optional[int]:
+    key = re.sub(r"[^a-z]", "", (token or "").lower())
+    if not key:
+        return None
+    if key in _WEEKDAY_NUM:
+        return _WEEKDAY_NUM[key]
+    if key[:3] in _WEEKDAY_NUM:
+        return _WEEKDAY_NUM[key[:3]]
+    return None
+
+
+def _extract_game_time(text: str) -> Optional[tuple[int, int, str]]:
+    """Return (hour24, minute, display like '5pm') or None."""
+    m = re.search(
+        r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b",
+        text,
+        re.I,
+    )
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        ampm = m.group(3).lower().replace(".", "")
+        if hour < 1 or hour > 12 or minute > 59:
+            return None
+        hour24 = hour % 12
+        if ampm.startswith("p"):
+            hour24 += 12
+        mins = f":{m.group(2)}" if m.group(2) and minute else ""
+        label = f"{hour}{mins}{'pm' if ampm.startswith('p') else 'am'}"
+        return hour24, minute, label
+
+    m24 = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
+    if m24:
+        hour24 = int(m24.group(1))
+        minute = int(m24.group(2))
+        hour12 = hour24 % 12 or 12
+        suffix = "pm" if hour24 >= 12 else "am"
+        mins = f":{m24.group(2)}" if minute else ""
+        label = f"{hour12}{mins}{suffix}"
+        return hour24, minute, label
+    return None
+
+
+def _resolve_game_date(text: str, *, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Resolve a calendar date from free text (weekday / month day / today)."""
+    now = now or datetime.now()
+    lower = text.lower()
+
+    if re.search(r"\btoday\b", lower):
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if re.search(r"\btomorrow\b", lower):
+        return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    m_md = re.search(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|"
+        r"dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?!:)\b",
+        lower,
+    )
+    if m_md:
+        month = _month_from_token(m_md.group(1))
+        day = int(m_md.group(2))
+        if month and 1 <= day <= 31:
+            year = now.year
+            try:
+                dt = datetime(year, month, day)
+            except ValueError:
+                return None
+            if dt.date() < now.date():
+                try:
+                    dt = datetime(year + 1, month, day)
+                except ValueError:
+                    return None
+            return dt
+
+    m_dm = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|"
+        r"dec(?:ember)?)\.?\b",
+        lower,
+    )
+    if m_dm:
+        day = int(m_dm.group(1))
+        month = _month_from_token(m_dm.group(2))
+        if month and 1 <= day <= 31:
+            year = now.year
+            try:
+                dt = datetime(year, month, day)
+            except ValueError:
+                return None
+            if dt.date() < now.date():
+                try:
+                    dt = datetime(year + 1, month, day)
+                except ValueError:
+                    return None
+            return dt
+
+    m_slash = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", text)
+    if m_slash:
+        a, b = int(m_slash.group(1)), int(m_slash.group(2))
+        # HK-style day/month when ambiguous or first number > 12
+        if a > 12:
+            day, month = a, b
+        elif b > 12:
+            month, day = a, b
+        else:
+            day, month = a, b
+        year = now.year
+        if m_slash.group(3):
+            y = int(m_slash.group(3))
+            year = y if y > 99 else 2000 + y
+        try:
+            return datetime(year, month, day)
+        except ValueError:
+            return None
+
+    m_wd = re.search(
+        r"\b(mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rs(?:day)?)?|fri(?:day)?|"
+        r"sat(?:urday)?|sun(?:day)?)\b",
+        lower,
+    )
+    if m_wd:
+        target = _weekday_from_token(m_wd.group(1))
+        if target is not None:
+            days_ahead = (target - now.weekday()) % 7
+            return (now + timedelta(days=days_ahead)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+
+    return None
+
+
+def format_game_when_text(raw: str, *, now: Optional[datetime] = None) -> str:
+    """
+    Normalize game timing for storage, e.g. 'Sept 26 (Saturday) @ 5pm'.
+    Falls back to a lightly cleaned original if parsing fails.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return raw
+    now = now or datetime.now()
+    time_bits = _extract_game_time(raw)
+    date_dt = _resolve_game_date(raw, now=now)
+    if date_dt and time_bits:
+        _h, _m, time_label = time_bits
+        month = _MONTH_LABEL[date_dt.month]
+        weekday = _WEEKDAY_LABEL[date_dt.weekday()]
+        return f"{month} {date_dt.day} ({weekday}) @ {time_label}"
+
+    cleaned = re.sub(r"\s+", " ", raw).strip(" ,.-")
+    return cleaned
+
+
+def format_game_card(when_text: str, spots: Any, location: str = "") -> str:
+    """Member-facing line: 'Sept 26 (Saturday) @ 5pm - 3 spots' (+ location)."""
+    when = (when_text or "").strip() or "TBD"
+    try:
+        n = int(spots)
+        spot_bit = f"{n} spot" if n == 1 else f"{n} spots"
+    except (TypeError, ValueError):
+        spot_bit = f"{spots} spots" if spots is not None else "spots TBD"
+    line = f"{when} - {spot_bit}"
+    loc = (location or "").strip()
+    if loc and loc.lower() not in when.lower():
+        line = f"{line} · {loc}"
+    return line
+
+
 def parse_add_game(text: str) -> Optional[dict]:
     """Parse admin add-game intent via DeepSeek, with regex fallback.
 
@@ -6119,7 +6374,8 @@ def parse_add_game(text: str) -> Optional[dict]:
                             "Parse tennis game admin commands. Return ONLY JSON: "
                             '{"action":"add_game"|"none","when_text":"date and time together",'
                             '"location":"...","spots":4,"notes":"..."}. '
-                            "when_text must include both a date (weekday or calendar date) and a time. "
+                            "when_text must include both a date (weekday or calendar date) and a time "
+                            "(e.g. 'Sept 26 5pm' or 'Sat 3pm'). Do not include spots in when_text. "
                             "spots is required for add_game. "
                             "If location is missing, use an empty string. "
                             "Example input: Add game Sat 3pm 4 spots Happy Valley"
@@ -6224,7 +6480,7 @@ def finalize_add_game(parsed: dict) -> tuple[Optional[dict], Optional[str]]:
         )
 
     return {
-        "when_text": when_text,
+        "when_text": format_game_when_text(when_text),
         "location": location,
         "spots": spots,
         "notes": str(parsed.get("notes") or "").strip(),
@@ -7516,8 +7772,8 @@ def handle_logged_in(text: str) -> None:
                 created_by=normalize_handle(user.get("ig_handle", "admin")),
             )
             append_assistant(
-                f"Game added ✅ **#{gid}** — {game['when_text']} @ {game['location']} · "
-                f"{game['spots']} spots"
+                f"Game added ✅ **#{gid}** — "
+                f"{format_game_card(game['when_text'], game['spots'], game['location'])}"
             )
             return
 
