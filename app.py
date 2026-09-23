@@ -174,6 +174,7 @@ AVATAR_POOL: list[dict[str, Any]] = [
     {"file": "dumpling_cat.png", "emoji": "🐱", "label": "dumpling cat", "tags": ["dumpling", "dimsum", "bao", "cat", "foodie", "港", "🐱", "🐈", "🦋"]},
     {"file": "crosscourt_cat.png", "emoji": "🐱", "label": "tennis cat", "tags": ["cat", "tennis", "🐈", "🐱", "🦋"]},
     {"file": "tennis_pug.png", "emoji": "🐶", "label": "tennis pug", "tags": ["dog", "pug", "puppy", "狗", "🐕"]},
+    {"file": "surf_dog.png", "emoji": "🐕", "label": "court shiba", "tags": ["shiba", "shiba inu", "dog", "puppy", "狗", "🐕", "vip"]},
     {"file": "surf_dog.png", "emoji": "🐶", "label": "surf dog", "tags": ["surf", "beach", "dog", "sea", "ocean", "🏄"]},
     {"file": "coffee_bear.png", "emoji": "🐻", "label": "coffee bear", "tags": ["coffee", "cafe", "咖啡", "latte", "bear"]},
     {"file": "chef_pig.png", "emoji": "🐷", "label": "chef pig", "tags": ["chef", "cook", "foodie", "kitchen", "recipe", "豬"]},
@@ -256,6 +257,7 @@ TENNIS_ANIMALS: dict[str, str] = {
     "Backhand Bunny": "🐰",
     "Forehand Frog": "🐸",
     "Matchpoint Meerkat": "🐿️",
+    "Court Shiba": "🐕",
     "Spinny Squirrel": "🐿️",
     "Court Capybara": "🐹",
 }
@@ -270,6 +272,7 @@ ANIMAL_PHOTO_FILES.update({
     "Ace Axolotl": "ace_axolotl.png",
     "Crosscourt Cat": "crosscourt_cat.png",
     "Matchpoint Meerkat": "matchpoint_meerkat.png",
+    "Court Shiba": "surf_dog.png",
     "Court Capybara": "court_capybara.png",
 })
 
@@ -468,6 +471,7 @@ def init_db() -> None:
                 game_id INTEGER NOT NULL,
                 ig_handle TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                admin_seen INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(game_id, ig_handle)
             );
             """
@@ -494,6 +498,12 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN gate_detail TEXT")
         if "assign_why" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN assign_why TEXT")
+        # game_signups: flag new joins for admin login notices
+        signup_cols = {r[1] for r in conn.execute("PRAGMA table_info(game_signups)").fetchall()}
+        if signup_cols and "admin_seen" not in signup_cols:
+            conn.execute(
+                "ALTER TABLE game_signups ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"
+            )
     seed_admin_user()
 
 
@@ -501,9 +511,10 @@ def seed_admin_user() -> None:
     """Ensure @vip exists as admin with the club PIN. Renames the old vipstarbucks row."""
     handle = "vip"
     pin = "0413"
-    animal = "Matchpoint Meerkat"
+    animal = "Court Shiba"
     vibe = "Club captain energy — books the courts, then aces the banter."
-    emoji = TENNIS_ANIMALS[animal]
+    emoji = TENNIS_ANIMALS.get(animal) or "🐕"
+    avatar_path = "surf_dog.png"
     with get_conn() as conn:
         old = conn.execute(
             "SELECT id FROM users WHERE lower(ig_handle) = ?",
@@ -524,18 +535,20 @@ def seed_admin_user() -> None:
                 """
                 UPDATE users
                 SET pin_hash = ?, animal = ?, vibe = ?, animal_emoji = ?,
-                    mascot = ?, avatar_path = NULL, ai_enabled = 1
+                    mascot = ?, avatar_path = ?, ai_enabled = 1
                 WHERE id = ?
                 """,
-                (hash_pin(pin), animal, vibe, emoji, animal, row["id"]),
+                (hash_pin(pin), animal, vibe, emoji, animal, avatar_path, row["id"]),
             )
         else:
             conn.execute(
                 """
-                INSERT INTO users (ig_handle, pin_hash, animal, vibe, animal_emoji, mascot, avatar_path)
-                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                INSERT INTO users (
+                    ig_handle, pin_hash, animal, vibe, animal_emoji, mascot, avatar_path, ai_enabled
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 """,
-                (handle, hash_pin(pin), animal, vibe, emoji, animal),
+                (handle, hash_pin(pin), animal, vibe, emoji, animal, avatar_path),
             )
 
 
@@ -741,6 +754,170 @@ def insert_game(
             (when_text.strip(), (location or "").strip(), max(1, int(spots)), notes.strip(), created_by),
         )
         return int(cur.lastrowid)
+
+
+def delete_game(game_id: int) -> tuple[bool, dict]:
+    """Delete a game and its signups. Returns (ok, game_snapshot)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, when_text, location, spots FROM games WHERE id = ?",
+            (int(game_id),),
+        ).fetchone()
+        if not row:
+            return False, {}
+        conn.execute("DELETE FROM game_signups WHERE game_id = ?", (int(game_id),))
+        conn.execute("DELETE FROM games WHERE id = ?", (int(game_id),))
+    return True, dict(row)
+
+
+def admin_add_user(ig_handle: str, pin: str) -> tuple[str, dict]:
+    """
+    Create or update a member with a PIN, gated in.
+    Returns ('created'|'updated'|'bad', user).
+    """
+    handle = normalize_handle(ig_handle)
+    if not handle or not re.match(r"^[A-Za-z0-9._]{2,30}$", handle):
+        return "bad", {}
+    if not re.fullmatch(r"\d{4}", pin or ""):
+        return "bad", {}
+    existing = get_user_by_handle(handle)
+    animal = "club tennis"
+    emoji = CLUB_TENNIS_EMOJI
+    vibe = "Added by admin."
+    avatar_path = CLUB_TENNIS_FILE
+    with get_conn() as conn:
+        if existing:
+            conn.execute(
+                """
+                UPDATE users
+                SET pin_hash = ?, ai_enabled = 1, gate_override = 1,
+                    animal = COALESCE(NULLIF(animal, ''), ?),
+                    mascot = COALESCE(NULLIF(mascot, ''), ?),
+                    animal_emoji = COALESCE(NULLIF(animal_emoji, ''), ?),
+                    avatar_path = COALESCE(NULLIF(avatar_path, ''), ?),
+                    vibe = COALESCE(NULLIF(vibe, ''), ?)
+                WHERE lower(ig_handle) = ?
+                """,
+                (
+                    hash_pin(pin),
+                    animal,
+                    animal,
+                    emoji,
+                    avatar_path,
+                    vibe,
+                    handle,
+                ),
+            )
+            return "updated", get_user_by_handle(handle) or {}
+        conn.execute(
+            """
+            INSERT INTO users (
+                ig_handle, pin_hash, animal, vibe, animal_emoji, mascot,
+                avatar_path, ai_enabled, gate_override, gate_detail, assign_why
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
+            """,
+            (
+                handle,
+                hash_pin(pin),
+                animal,
+                vibe,
+                emoji,
+                animal,
+                avatar_path,
+                "Admin created this account and forced gate in.",
+                "Admin created account.",
+            ),
+        )
+    return "created", get_user_by_handle(handle) or {}
+
+
+def admin_delete_user(ig_handle: str) -> tuple[str, dict]:
+    """
+    Delete a member and their game signups (spots restored).
+    Returns ('deleted'|'missing'|'protected', user_or_empty).
+    """
+    handle = normalize_handle(ig_handle)
+    if not handle:
+        return "missing", {}
+    if handle in ADMIN_HANDLES:
+        return "protected", {"ig_handle": handle}
+    user = get_user_by_handle(handle)
+    if not user:
+        return "missing", {}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT game_id FROM game_signups WHERE lower(ig_handle) = ?",
+            (handle,),
+        ).fetchall()
+        for r in rows:
+            conn.execute(
+                "UPDATE games SET spots = spots + 1 WHERE id = ?",
+                (r["game_id"],),
+            )
+        conn.execute(
+            "DELETE FROM game_signups WHERE lower(ig_handle) = ?",
+            (handle,),
+        )
+        conn.execute(
+            "DELETE FROM users WHERE lower(ig_handle) = ?",
+            (handle,),
+        )
+    return "deleted", user
+
+
+def pending_admin_signup_notices() -> list[dict]:
+    with get_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(game_signups)").fetchall()}
+        if "admin_seen" not in cols:
+            return []
+        rows = conn.execute(
+            """
+            SELECT s.id AS signup_id, s.ig_handle, s.created_at,
+                   g.id AS game_id, g.when_text, g.location, g.spots
+            FROM game_signups s
+            JOIN games g ON g.id = s.game_id
+            WHERE COALESCE(s.admin_seen, 0) = 0
+            ORDER BY s.id ASC
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_admin_signups_seen(signup_ids: list[int]) -> None:
+    if not signup_ids:
+        return
+    with get_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(game_signups)").fetchall()}
+        if "admin_seen" not in cols:
+            return
+        conn.executemany(
+            "UPDATE game_signups SET admin_seen = 1 WHERE id = ?",
+            [(int(i),) for i in signup_ids],
+        )
+
+
+def format_admin_signup_notices(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    lines = ["**New game signups since last check**"]
+    for r in rows:
+        when = r.get("when_text") or "a game"
+        loc = r.get("location") or DEFAULT_GAME_LOCATION
+        lines.append(
+            f"- @{r.get('ig_handle')} joined **#{r.get('game_id')}** {when} @ {loc} "
+            f"({r.get('spots')} spots left)"
+        )
+    return "\n".join(lines)
+
+
+def consume_admin_signup_notices() -> str:
+    """Return unread signup notices for admins and mark them seen."""
+    rows = pending_admin_signup_notices()
+    if not rows:
+        return ""
+    mark_admin_signups_seen([int(r["signup_id"]) for r in rows])
+    return format_admin_signup_notices(rows)
 
 
 def games_as_context() -> str:
@@ -951,10 +1128,16 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
                 game_id INTEGER NOT NULL,
                 ig_handle TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                admin_seen INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(game_id, ig_handle)
             )
             """
         )
+        signup_cols = {r[1] for r in conn.execute("PRAGMA table_info(game_signups)").fetchall()}
+        if "admin_seen" not in signup_cols:
+            conn.execute(
+                "ALTER TABLE game_signups ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"
+            )
         games = conn.execute(
             """
             SELECT id, when_text, location, spots
@@ -987,7 +1170,7 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
         if cur.rowcount != 1:
             return "full", dict(target)
         conn.execute(
-            "INSERT INTO game_signups (game_id, ig_handle) VALUES (?, ?)",
+            "INSERT INTO game_signups (game_id, ig_handle, admin_seen) VALUES (?, ?, 0)",
             (target["id"], handle),
         )
         updated = conn.execute(
@@ -1170,24 +1353,30 @@ def admin_help_text() -> str:
         "**Admin commands**\n\n"
         "1. **Add a game** — `Add game Sat 3pm 4 spots`\n"
         f"   Needs a date, a time, and spots. Location defaults to **{DEFAULT_GAME_LOCATION}**.\n"
-        "2. **Gate in** — `gate in @handle`\n"
+        "2. **Delete a game** — `delete game #3`\n"
+        "   Removes the game and all its signups.\n"
+        "3. **Add a user** — `add user @handle 4821`\n"
+        "   Creates (or updates) a member with that PIN, gated in.\n"
+        "4. **Delete a user** — `delete user @handle`\n"
+        "   Removes the member and frees any held spots. Admin accounts are protected.\n"
+        "5. **Gate in** — `gate in @handle`\n"
         "   Club chat, even if the automatic check would block them.\n"
-        "3. **Gate out** — `gate out @handle`\n"
+        "6. **Gate out** — `gate out @handle`\n"
         "   Tennis stories only. No club chat.\n"
-        "4. **User** — `user @handle`\n"
+        "7. **User** — `user @handle`\n"
         "   Profile, why they are gated in or out (including the 25% roll), and why that character.\n"
-        "5. **List users** — `list users` or `users`\n"
+        "8. **List users** — `list users` or `users`\n"
         "   All members with gate / character / PIN status.\n"
-        "6. **Reset PIN** — `reset pin @handle 4821`\n"
+        "9. **Reset PIN** — `reset pin @handle 4821`\n"
         "   Sets a new 4-digit PIN.\n"
-        "7. **Board** — `games`\n"
+        "10. **Board** — `games`\n"
         "   List upcoming games.\n"
-        "8. **Signups** — `signups`\n"
+        "11. **Signups** — `signups`\n"
         "   Who registered for each game (@handles).\n"
-        "9. **Remove** — `remove @handle` or `remove @handle from #3`\n"
+        "12. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
         "   Drop them from a game and put the spot back.\n"
-        "10. **Help** — `help` or `/help`\n"
-        "11. **Log out** — `logout`"
+        "13. **Help** — `help` or `/help`\n"
+        "14. **Log out** — `logout`"
     )
 
 
@@ -1223,6 +1412,56 @@ def try_admin_command(text: str) -> bool:
         "whos in",
     }:
         append_assistant(signups_as_context())
+        return True
+    del_game = re.fullmatch(
+        r"(?:/)?(?:delete|remove)\s+game\s+#?(\d+)",
+        raw,
+        re.I,
+    )
+    if del_game:
+        gid = int(del_game.group(1))
+        ok, game = delete_game(gid)
+        if not ok:
+            append_assistant(f"No game **#{gid}** on the board.")
+        else:
+            when = game.get("when_text") or f"#{gid}"
+            loc = game.get("location") or DEFAULT_GAME_LOCATION
+            append_assistant(f"Deleted game **#{gid}** — {when} @ {loc}.")
+        return True
+    add_user = re.fullmatch(
+        r"(?:/)?add\s+user\s+@?([A-Za-z0-9._]{2,30})\s+(\d{4})",
+        raw,
+        re.I,
+    )
+    if add_user:
+        handle = normalize_handle(add_user.group(1))
+        pin = add_user.group(2)
+        status, user = admin_add_user(handle, pin)
+        if status == "bad":
+            append_assistant("Use `add user @handle 4821` with a valid handle and 4-digit PIN.")
+        elif status == "created":
+            append_assistant(
+                f"Added **@{handle}** with PIN `{pin}`, gated **in**."
+            )
+        else:
+            append_assistant(
+                f"Updated **@{handle}** — PIN set to `{pin}`, gated **in**."
+            )
+        return True
+    del_user = re.fullmatch(
+        r"(?:/)?(?:delete|remove)\s+user\s+@?([A-Za-z0-9._]{2,30})",
+        raw,
+        re.I,
+    )
+    if del_user:
+        handle = normalize_handle(del_user.group(1))
+        status, user = admin_delete_user(handle)
+        if status == "protected":
+            append_assistant(f"**@{handle}** is an admin account and can’t be deleted.")
+        elif status == "missing":
+            append_assistant(f"No account for **@{handle}**.")
+        else:
+            append_assistant(f"Deleted **@{handle}**. Any held spots were put back.")
         return True
     drop = re.fullmatch(
         r"(?:/)?(?:remove|drop|unbook)\s+@?([A-Za-z0-9._]{2,30})"
@@ -6868,6 +7107,8 @@ def handle_need_pin_signup(text: str) -> None:
         )
         return
     invite = maybe_game_invite()
+    notices = consume_admin_signup_notices() if is_admin(user) else ""
+    notice_bit = f"\n\n{notices}" if notices else ""
     append_assistant(
         f"You’re in, **{animal}** {emoji}\n\n"
         "Ask about games, spots, or courts. "
@@ -6877,6 +7118,7 @@ def handle_need_pin_signup(text: str) -> None:
             else ""
         )
         + invite
+        + notice_bit
     )
 
 
@@ -6901,6 +7143,9 @@ def handle_need_pin_login(text: str) -> None:
         return
 
     rewrite_last_user("****")
+    if is_admin(user):
+        complete_admin_login(user)
+        return
     st.session_state.user = user
     st.session_state.auth_state = LOGGED_IN
     animal = user.get("mascot") or user.get("animal") or "player"
@@ -6913,13 +7158,6 @@ def handle_need_pin_login(text: str) -> None:
         )
         return
     invite = maybe_game_invite()
-    if is_admin(user):
-        append_assistant(
-            f"Back on court, **{animal}** {emoji}\n\n"
-            "Type `help` for admin commands."
-            + invite
-        )
-        return
     append_assistant(
         f"Back on court, **{animal}** {emoji}\n\n"
         "What do you want to know about upcoming games?"
@@ -6933,19 +7171,30 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     st.session_state.pending_handle = normalize_handle(user.get("ig_handle") or "")
     st.session_state.handle_locked = False
     st.session_state.locked_handle = ""
-    animal = user.get("mascot") or user.get("animal") or "player"
-    emoji = user.get("animal_emoji") or "🎾"
-    invite = maybe_game_invite() if user_ai_enabled(user) else ""
-    if not user_ai_enabled(user):
+    # Refresh from DB so seeded character (e.g. Court Shiba) shows immediately
+    fresh = get_user_by_handle(user.get("ig_handle") or "") or user
+    st.session_state.user = fresh
+    animal = fresh.get("mascot") or fresh.get("animal") or "player"
+    emoji = fresh.get("animal_emoji") or "🎾"
+    invite = maybe_game_invite() if user_ai_enabled(fresh) else ""
+    notices = consume_admin_signup_notices() if is_admin(fresh) else ""
+    notice_bit = f"\n\n{notices}" if notices else ""
+    photo = animal_photo_path(animal, fresh.get("avatar_path"))
+    photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
+    if not user_ai_enabled(fresh):
         append_assistant(
             f"{welcome}, **{animal}** {emoji}\n\n"
             + guest_tennis_story_reply("", remind_ig=False)
+            + notice_bit,
+            image=photo_path,
         )
         return
     append_assistant(
         f"{welcome}, **{animal}** {emoji}\n\n"
         "Type `help` for admin commands."
         + invite
+        + notice_bit,
+        image=photo_path,
     )
 
 
