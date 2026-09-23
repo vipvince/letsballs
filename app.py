@@ -35,6 +35,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tennis.db")
+TURSO_LOCAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tennis_turso.db")
 AVATAR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatars")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 PROFILE_DIR = os.path.join(AVATAR_DIR, "profiles")
@@ -415,18 +416,149 @@ def completion_text(completion: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-@contextmanager
-def get_conn():
+# ---------------------------------------------------------------------------
+# Database — local SQLite, or Turso (durable on Streamlit Cloud)
+# ---------------------------------------------------------------------------
+
+
+def _secret_or_env(name: str) -> str:
+    val = (os.environ.get(name) or "").strip()
+    if val:
+        return val
+    try:
+        return str(st.secrets.get(name, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def turso_creds() -> tuple[str, str]:
+    return _secret_or_env("TURSO_DATABASE_URL"), _secret_or_env("TURSO_AUTH_TOKEN")
+
+
+def using_durable_db() -> bool:
+    url, token = turso_creds()
+    return bool(url and token)
+
+
+def _is_streamlit_cloud() -> bool:
+    return bool(
+        os.environ.get("STREAMLIT_SHARING_MODE")
+        or os.environ.get("STREAMLIT_CLOUD")
+        or os.path.isdir("/mount/src")
+    )
+
+
+def persistence_warning_for_admin() -> str:
+    """Streamlit Cloud wipes local SQLite on reboot unless Turso is configured."""
+    if using_durable_db():
+        return ""
+    if not _is_streamlit_cloud():
+        return ""
+    return (
+        "\n\n⚠️ **Storage warning:** this Cloud host resets local files on reboot. "
+        "Deleted games/users can reappear from an old snapshot, or vanish. "
+        "Add free **Turso** secrets (`TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`) "
+        "so the club board stays permanent."
+    )
+
+
+def _dict_row_factory(cursor, row):
+    if cursor.description is None:
+        return row
+    return {col[0]: row[i] for i, col in enumerate(cursor.description)}
+
+
+def _open_db_connection():
+    """
+    Prefer Turso when secrets exist (survives Streamlit Cloud reboots).
+    Otherwise use local tennis.db (fine on your PC; ephemeral on Cloud).
+    """
+    url, token = turso_creds()
+    if url and token:
+        try:
+            import libsql
+
+            # Embedded replica: SQLite-compatible API + cloud primary
+            conn = libsql.connect(
+                TURSO_LOCAL_PATH,
+                sync_url=url,
+                auth_token=token,
+            )
+            try:
+                conn.sync()
+            except Exception:
+                pass
+            if hasattr(conn, "row_factory"):
+                conn.row_factory = _dict_row_factory
+            return conn, True
+        except Exception:
+            try:
+                import libsql
+
+                conn = libsql.connect(database=url, auth_token=token)
+                if hasattr(conn, "row_factory"):
+                    conn.row_factory = _dict_row_factory
+                return conn, True
+            except Exception:
+                pass
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    return conn, False
+
+
+def _run_script(conn, script: str) -> None:
+    if hasattr(conn, "executescript"):
+        conn.executescript(script)
+        return
+    for chunk in script.split(";"):
+        stmt = chunk.strip()
+        if stmt:
+            conn.execute(stmt)
+
+
+@contextmanager
+def get_conn():
+    conn, durable = _open_db_connection()
     try:
         yield conn
         conn.commit()
+        if durable and hasattr(conn, "sync"):
+            try:
+                conn.sync()
+            except Exception:
+                pass
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _as_dict(row) -> dict:
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return dict(row)
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
+def _pragma_signup_cols(conn) -> set[str]:
+    names = set()
+    for r in conn.execute("PRAGMA table_info(game_signups)").fetchall():
+        if isinstance(r, dict):
+            names.add(r.get("name") or "")
+        else:
+            names.add(r[1])
+    return {n for n in names if n}
 
 
 def format_handle(ig_handle: str) -> str:
@@ -438,7 +570,8 @@ def format_handle(ig_handle: str) -> str:
 def init_db() -> None:
     os.makedirs(PROFILE_DIR, exist_ok=True)
     with get_conn() as conn:
-        conn.executescript(
+        _run_script(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -474,10 +607,19 @@ def init_db() -> None:
                 admin_seen INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(game_id, ig_handle)
             );
-            """
+            """,
         )
         # Light migrations for older DBs
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        def _col_names(pragma_rows):
+            names = set()
+            for r in pragma_rows:
+                if isinstance(r, dict):
+                    names.add(r.get("name") or r.get("Name"))
+                else:
+                    names.add(r[1])
+            return {n for n in names if n}
+
+        cols = _col_names(conn.execute("PRAGMA table_info(users)").fetchall())
         if "mascot" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN mascot TEXT")
         if "avatar_path" not in cols:
@@ -498,8 +640,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN gate_detail TEXT")
         if "assign_why" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN assign_why TEXT")
-        # game_signups: flag new joins for admin login notices
-        signup_cols = {r[1] for r in conn.execute("PRAGMA table_info(game_signups)").fetchall()}
+        signup_cols = _col_names(conn.execute("PRAGMA table_info(game_signups)").fetchall())
         if signup_cols and "admin_seen" not in signup_cols:
             conn.execute(
                 "ALTER TABLE game_signups ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"
@@ -568,7 +709,7 @@ def get_user_by_handle(ig_handle: str) -> Optional[dict]:
             "SELECT * FROM users WHERE lower(ig_handle) = ?",
             (handle,),
         ).fetchone()
-    return dict(row) if row else None
+    return _as_dict(row) if row else None
 
 
 def ensure_pending_handle(ig_handle: str) -> None:
@@ -714,7 +855,7 @@ def finalize_signup(ig_handle: str, pin: str) -> Optional[dict]:
             "SELECT * FROM users WHERE lower(ig_handle) = ?",
             (handle,),
         ).fetchone()
-    return dict(row) if row else None
+    return _as_dict(row) if row else None
 
 
 def verify_pin(ig_handle: str, pin: str) -> Optional[dict]:
@@ -735,7 +876,7 @@ def list_games(limit: int = 40) -> list[dict]:
             """,
             (limit,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_as_dict(r) for r in rows]
 
 
 def insert_game(
@@ -767,7 +908,7 @@ def delete_game(game_id: int) -> tuple[bool, dict]:
             return False, {}
         conn.execute("DELETE FROM game_signups WHERE game_id = ?", (int(game_id),))
         conn.execute("DELETE FROM games WHERE id = ?", (int(game_id),))
-    return True, dict(row)
+    return True, _as_dict(row)
 
 
 def admin_add_user(ig_handle: str, pin: str) -> tuple[str, dict]:
@@ -868,7 +1009,7 @@ def admin_delete_user(ig_handle: str) -> tuple[str, dict]:
 
 def pending_admin_signup_notices() -> list[dict]:
     with get_conn() as conn:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(game_signups)").fetchall()}
+        cols = _pragma_signup_cols(conn)
         if "admin_seen" not in cols:
             return []
         rows = conn.execute(
@@ -881,14 +1022,14 @@ def pending_admin_signup_notices() -> list[dict]:
             ORDER BY s.id ASC
             """
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_as_dict(r) for r in rows]
 
 
 def mark_admin_signups_seen(signup_ids: list[int]) -> None:
     if not signup_ids:
         return
     with get_conn() as conn:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(game_signups)").fetchall()}
+        cols = _pragma_signup_cols(conn)
         if "admin_seen" not in cols:
             return
         conn.executemany(
@@ -929,7 +1070,7 @@ def games_as_context() -> str:
         loc = g.get("location") or DEFAULT_GAME_LOCATION
         notes = f" ({g['notes']})" if g.get("notes") else ""
         lines.append(f"- #{g['id']}: {g['when_text']} @ {loc} — {g['spots']} spots{notes}")
-    return "Scheduled games:\n" + "\n".join(lines)
+    return "Scheduled games (live from database):\n" + "\n".join(lines)
 
 
 def list_game_signups() -> list[dict]:
@@ -966,8 +1107,8 @@ def list_game_signups() -> list[dict]:
             ).fetchall()
             out.append(
                 {
-                    **dict(g),
-                    "signups": [dict(r) for r in rows],
+                    **_as_dict(g),
+                    "signups": [_as_dict(r) for r in rows],
                 }
             )
     return out
@@ -990,7 +1131,7 @@ def signups_as_context() -> str:
             continue
         names = "\n".join(f"- @{s['ig_handle']}" for s in people)
         blocks.append(f"{header}\n{names}")
-    return "**Game signups**\n\n" + "\n\n".join(blocks)
+    return "**Game signups (live from database)**\n\n" + "\n\n".join(blocks)
 
 
 def remove_game_signup(ig_handle: str, game_id: Optional[int] = None) -> tuple[str, dict]:
@@ -1041,6 +1182,7 @@ def remove_game_signup(ig_handle: str, game_id: Optional[int] = None) -> tuple[s
                 return "not_found", {"id": int(game_id)}
             any_games = conn.execute("SELECT id FROM games LIMIT 1").fetchone()
             return ("none" if not any_games else "not_found"), {}
+        row = _as_dict(row)
         conn.execute("DELETE FROM game_signups WHERE id = ?", (row["signup_id"],))
         conn.execute(
             "UPDATE games SET spots = spots + 1 WHERE id = ?",
@@ -1050,7 +1192,7 @@ def remove_game_signup(ig_handle: str, game_id: Optional[int] = None) -> tuple[s
             "SELECT id, when_text, location, spots FROM games WHERE id = ?",
             (row["id"],),
         ).fetchone()
-    return "removed", dict(updated) if updated else dict(row)
+    return "removed", _as_dict(updated) if updated else row
 
 
 def remove_signup_reply(status: str, handle: str, game: dict) -> str:
@@ -1133,7 +1275,7 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             )
             """
         )
-        signup_cols = {r[1] for r in conn.execute("PRAGMA table_info(game_signups)").fetchall()}
+        signup_cols = _pragma_signup_cols(conn)
         if "admin_seen" not in signup_cols:
             conn.execute(
                 "ALTER TABLE game_signups ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"
@@ -1149,11 +1291,12 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             return "none", {}
         target = None
         for game in games:
+            game = _as_dict(game)
             if int(game["spots"] or 0) > 0:
                 target = game
                 break
         if target is None:
-            return "full", dict(games[0])
+            return "full", _as_dict(games[0])
         prior = conn.execute(
             """
             SELECT id FROM game_signups
@@ -1162,13 +1305,13 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             (target["id"], handle),
         ).fetchone()
         if prior:
-            return "already", dict(target)
+            return "already", target
         cur = conn.execute(
             "UPDATE games SET spots = spots - 1 WHERE id = ? AND spots > 0",
             (target["id"],),
         )
         if cur.rowcount != 1:
-            return "full", dict(target)
+            return "full", target
         conn.execute(
             "INSERT INTO game_signups (game_id, ig_handle, admin_seen) VALUES (?, ?, 0)",
             (target["id"], handle),
@@ -1177,7 +1320,7 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             "SELECT id, when_text, location, spots FROM games WHERE id = ?",
             (target["id"],),
         ).fetchone()
-    return "ok", dict(updated)
+    return "ok", _as_dict(updated)
 
 
 def game_join_reply(status: str, game: dict) -> str:
@@ -1307,7 +1450,7 @@ def list_users(limit: int = 80) -> list[dict]:
             """,
             (limit,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [_as_dict(r) for r in rows]
 
 
 def users_as_context() -> str:
@@ -1376,7 +1519,8 @@ def admin_help_text() -> str:
         "12. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
         "   Drop them from a game and put the spot back.\n"
         "13. **Help** — `help` or `/help`\n"
-        "14. **Log out** — `logout`"
+        "14. **Log out** — `logout`\n\n"
+        "_On Streamlit Cloud, add Turso secrets so deletes/signups survive reboots._"
     )
 
 
@@ -7179,6 +7323,7 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     invite = maybe_game_invite() if user_ai_enabled(fresh) else ""
     notices = consume_admin_signup_notices() if is_admin(fresh) else ""
     notice_bit = f"\n\n{notices}" if notices else ""
+    notice_bit += persistence_warning_for_admin() if is_admin(fresh) else ""
     photo = animal_photo_path(animal, fresh.get("avatar_path"))
     photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
     if not user_ai_enabled(fresh):
@@ -7263,7 +7408,9 @@ def handle_logged_in(text: str) -> None:
     extra = (
         f"Member: @{user.get('ig_handle')} · mascot {user.get('animal')}.\n"
         f"{games_as_context()}\n"
-        f"{game_rule}"
+        f"{game_rule}\n"
+        "Trust only the live Scheduled games block above for what exists. "
+        "Never invent games, signups, or members from earlier chat messages."
     )
     if is_admin(user):
         extra += (

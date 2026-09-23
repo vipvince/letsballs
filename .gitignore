@@ -1,6 +1,7 @@
 avatars/profiles/
 .env
 tennis.db
+tennis_turso.db
 __pycache__/
 *.pyc
 .streamlit/secrets.toml
