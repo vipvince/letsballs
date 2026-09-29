@@ -7236,7 +7236,12 @@ def _apply_restored_user(user: dict) -> None:
     if not st.session_state.messages:
         animal = user.get("mascot") or user.get("animal") or "player"
         emoji = user.get("animal_emoji") or "🎾"
-        append_assistant(f"Welcome back, **{animal}** {emoji} — you’re still signed in.")
+        photo = animal_photo_path(animal, user.get("avatar_path"))
+        photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
+        append_assistant(
+            f"Welcome back, **{animal}** {emoji}",
+            image=photo_path,
+        )
 
 
 def try_restore_login(cookie_map: Optional[dict] = None) -> bool:
