@@ -7072,6 +7072,9 @@ def _query_login_value() -> Optional[str]:
         raw = raw[0] if raw else None
     text = str(raw or "").strip()
     return text or None
+
+
+def _set_login_query(payload: str) -> None:
     try:
         st.query_params[LOGIN_QUERY_KEY] = payload
     except Exception:
