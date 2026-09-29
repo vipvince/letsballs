@@ -1418,6 +1418,37 @@ def games_as_context() -> str:
     return "Scheduled games (live from database):\n" + "\n".join(lines)
 
 
+def games_board_markdown() -> str:
+    """Member-facing board — clean visual list for chat / one-tap Board."""
+    games = list_games()
+    if not games:
+        return "No upcoming games on the board yet."
+    blocks = ["**Upcoming games**"]
+    for g in games:
+        when = (g.get("when_text") or "TBD").strip()
+        loc = (g.get("location") or DEFAULT_GAME_LOCATION).strip()
+        try:
+            spots = int(g.get("spots") or 0)
+        except (TypeError, ValueError):
+            spots = g.get("spots")
+        spot_bit = f"{spots} spot left" if spots == 1 else f"{spots} spots left"
+        blocks.append(
+            f"**#{g['id']}** · {when}  \n"
+            f"📍 {loc} · {spot_bit}"
+        )
+    return "\n\n".join(blocks)
+
+
+def member_tips_text() -> str:
+    return (
+        "**Quick tips**\n\n"
+        "- **Join** — grab the next open spot\n"
+        "- **Board** — see upcoming games\n"
+        "- Ask about racquets, weather, courts — tennis talk is welcome\n"
+        "- Type `logout` to switch accounts"
+    )
+
+
 def list_game_signups() -> list[dict]:
     """Games with the Instagram handles that held a spot, newest game first."""
     with get_conn() as conn:
@@ -2010,8 +2041,8 @@ def try_admin_command(text: str) -> bool:
     if lower in {"animals", "/animals", "list animals", "avatars", "photos"}:
         append_assistant(animals_as_context())
         return True
-    if lower in {"games", "/games", "list games", "upcoming", "upcoming games"}:
-        append_assistant(games_as_context())
+    if lower in {"games", "/games", "list games", "upcoming", "upcoming games", "board"}:
+        append_assistant(games_board_markdown())
         return True
     if lower in {
         "users",
@@ -7260,9 +7291,11 @@ def try_restore_login(cookie_map: Optional[dict] = None) -> bool:
     )
 
     # CookieManager jar often empty on the first run of a new tab — one hydrate rerun.
+    # Skip the wait when the HTTP cookie already arrived with the request.
     if (
         not raw
         and cm is not None
+        and not _http_cookie_value()
         and not st.session_state.get("_ppt_cookie_hydrated")
     ):
         st.session_state["_ppt_cookie_hydrated"] = True
@@ -7545,17 +7578,28 @@ def focus_chat_input() -> None:
                 }}
                 function bindFilm() {{
                   const doc = window.parent.document;
-                  const video = doc.querySelector(".lt-film");
+                  const poster = doc.querySelector(".lt-poster");
+                  const video = doc.querySelector(".lt-video") || doc.querySelector(".lt-film");
                   const btn = doc.querySelector(".lt-sound");
-                  if (!video || !btn || video.dataset.bound === "1") return;
-                  video.dataset.bound = "1";
+                  if (!btn || btn.dataset.bound === "1") return;
+                  btn.dataset.bound = "1";
+                  if (!video || video.tagName !== "VIDEO") return;
                   video.loop = false;
                   video.muted = false;
                   function paint() {{
-                    const on = !video.muted;
+                    const on = !video.muted && !video.paused;
                     btn.setAttribute("aria-pressed", on ? "true" : "false");
-                    btn.textContent = on ? "Mute" : "Sound";
-                    btn.setAttribute("aria-label", on ? "Mute sound" : "Turn sound on");
+                    btn.textContent = on ? "Mute" : "Play";
+                    btn.setAttribute("aria-label", on ? "Mute sound" : "Play with sound");
+                  }}
+                  function ensureSrc() {{
+                    const src = video.getAttribute("data-src") || "";
+                    if (src && !video.getAttribute("src")) {{
+                      video.setAttribute("src", src);
+                      video.load();
+                    }}
+                    if (poster) poster.hidden = true;
+                    video.hidden = false;
                   }}
                   video.addEventListener("ended", function() {{
                     video.pause();
@@ -7563,26 +7607,19 @@ def focus_chat_input() -> None:
                     if (end) {{
                       try {{ video.currentTime = end; }} catch (e) {{}}
                     }}
+                    paint();
                   }});
                   btn.addEventListener("click", function() {{
-                    video.muted = !video.muted;
-                    if (video.paused && video.currentTime < (video.duration || 1) - 0.2) {{
+                    ensureSrc();
+                    if (video.paused) {{
+                      video.muted = false;
                       video.play().catch(function() {{}});
+                    }} else {{
+                      video.muted = !video.muted;
+                      if (video.muted) video.pause();
                     }}
                     paint();
                   }});
-                  const started = video.play();
-                  if (started && started.then) {{
-                    started.then(function() {{ paint(); }}).catch(function() {{
-                      video.muted = false;
-                      paint();
-                      function startWithSound() {{
-                        video.muted = false;
-                        video.play().then(paint).catch(function() {{}});
-                      }}
-                      doc.addEventListener("pointerdown", startWithSound, {{ once: true, capture: true }});
-                    }});
-                  }}
                   paint();
                 }}
                 let tries = 0;
@@ -7614,7 +7651,10 @@ def inject_styles() -> None:
           html, body, .stApp {
             font-family: "Manrope", "Segoe UI", sans-serif;
             color: #1a1f1c;
-            background: #f6f5f2 !important;
+            background:
+              radial-gradient(ellipse 90% 55% at 8% -8%, rgba(255, 214, 102, 0.38), transparent 58%),
+              radial-gradient(ellipse 80% 50% at 100% 0%, rgba(120, 190, 140, 0.32), transparent 52%),
+              linear-gradient(180deg, #f8f4e9 0%, #eef6ef 42%, #f4f7f3 100%) !important;
             height: 100%;
           }
           [data-testid="stAppViewContainer"],
@@ -7709,7 +7749,7 @@ def inject_styles() -> None:
             top: auto !important;
             height: auto !important;
             z-index: 1000 !important;
-            background: #f6f5f2 !important;
+            background: linear-gradient(180deg, rgba(244,247,243,0), #f4f7f3 28%) !important;
             padding: 0 0 max(0.7rem, env(safe-area-inset-bottom)) !important;
             margin: 0 !important;
           }
@@ -7828,24 +7868,36 @@ def inject_styles() -> None:
             margin: 0 0 0.35rem;
           }
           .lt-brand {
-            margin: 0 0 0.15rem;
+            margin: 0 0 0.05rem;
             text-align: center;
             font-size: 1.35rem !important;
             font-weight: 700;
             letter-spacing: 0.01em;
-            color: #3d5c4a;
+            color: #2f5d45;
             line-height: 1.25;
           }
+          .lt-tag {
+            margin: 0 0 0.25rem;
+            text-align: center;
+            font-size: 0.78rem !important;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-transform: lowercase;
+            color: #6a7f70;
+            line-height: 1.2;
+          }
           .lt-stage { position: relative; }
-          .lt-film {
+          .lt-film,
+          .lt-poster,
+          .lt-video {
             width: 100%;
             height: 90px;
             object-fit: cover;
             object-position: center 42%;
-            border-radius: 12px;
+            border-radius: 14px;
             display: block;
             background: #1c2822;
-            box-shadow: 0 8px 20px rgba(20, 32, 24, 0.08);
+            box-shadow: 0 10px 24px rgba(20, 32, 24, 0.1);
           }
           .lt-sound {
             position: absolute;
@@ -7873,7 +7925,7 @@ def inject_styles() -> None:
             justify-content: center;
             gap: 0.55rem;
             margin: 0;
-            padding: 0.2rem 0 0.35rem;
+            padding: 0.35rem 0 0.45rem;
             overflow: visible;
             border-bottom: 1px solid rgba(28, 40, 34, 0.08);
           }
@@ -7889,6 +7941,16 @@ def inject_styles() -> None:
             box-shadow: 0 4px 10px rgba(20, 32, 24, 0.1);
             cursor: pointer;
             overflow: visible;
+            animation: critter-bob 2.6s ease-in-out infinite;
+          }
+          .critter:nth-child(2) { animation-delay: 0.2s; }
+          .critter:nth-child(3) { animation-delay: 0.4s; }
+          .critter:nth-child(4) { animation-delay: 0.1s; }
+          .critter:nth-child(5) { animation-delay: 0.35s; }
+          .critter:nth-child(6) { animation-delay: 0.55s; }
+          @keyframes critter-bob {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-4px); }
           }
           .critter img {
             width: 100%;
@@ -7902,6 +7964,7 @@ def inject_styles() -> None:
             z-index: 6;
             border-color: #3d5c4a;
             outline: none;
+            animation-play-state: paused;
           }
           .critter:hover img, .critter:focus-visible img, .critter.is-open img {
             transform: scale(1.08);
@@ -7918,6 +7981,21 @@ def inject_styles() -> None:
             border: 3px solid #ffffff;
           }
           [data-testid="stVerticalBlock"] { overflow: visible; }
+
+          /* One-tap action row */
+          div[data-testid="stButton"] > button {
+            border-radius: 999px !important;
+            border: 1px solid rgba(47, 93, 69, 0.18) !important;
+            background: rgba(255, 255, 255, 0.88) !important;
+            color: #244033 !important;
+            font-family: "Manrope", "Segoe UI", sans-serif !important;
+            font-weight: 650 !important;
+            box-shadow: 0 4px 12px rgba(20, 32, 24, 0.06) !important;
+          }
+          div[data-testid="stButton"] > button:hover {
+            border-color: #3d5c4a !important;
+            background: #eef6ef !important;
+          }
 
           .character-hero {
             margin: 0 0 0.15rem;
@@ -7980,7 +8058,7 @@ def choose_rail_avatars() -> list[str]:
         for name in os.listdir(AVATAR_DIR)
         if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
     ]
-    pick = random.sample(names, k=min(8, len(names))) if names else []
+    pick = random.sample(names, k=min(6, len(names))) if names else []
     st.session_state["_rail_avatars"] = pick
     return pick
 
@@ -7997,24 +8075,89 @@ def render_little_tennis_header() -> None:
             continue
         buttons.append(
             f'<button type="button" class="critter" aria-label="{label}">'
-            f'<img src="{src}" alt="" />'
+            f'<img src="{src}" alt="" loading="lazy" />'
             f"</button>"
         )
     poster = _hosted_media_url(os.path.join(STATIC_DIR, "poster.jpg"))
     film = _hosted_media_url(os.path.join(STATIC_DIR, "video.mp4"))
-    poster_attr = f' poster="{poster}"' if poster else ""
-    src_attr = f' src="{film}"' if film else ""
+    # Poster-only on first paint — video (2.7MB) loads only when Sound/Play is tapped.
+    poster_img = (
+        f'<img class="lt-film lt-poster" src="{poster}" alt="Animals on court" '
+        f'width="720" height="90" decoding="async" />'
+        if poster
+        else ""
+    )
+    video_tag = (
+        f'<video class="lt-film lt-video" playsinline preload="none" '
+        f'poster="{poster}" data-src="{film}" hidden></video>'
+        if film
+        else ""
+    )
     st.markdown(
         '<header class="lt-head">'
         '<p class="lt-brand">www.playplaytennis.com</p>'
+        '<p class="lt-tag">animals on court · let’s play</p>'
         '<div class="lt-stage">'
-        f'<video class="lt-film" playsinline preload="metadata"{poster_attr}{src_attr}></video>'
-        '<button type="button" class="lt-sound" aria-pressed="true" aria-label="Mute sound">Mute</button>'
+        f"{poster_img}{video_tag}"
+        '<button type="button" class="lt-sound" aria-pressed="false" aria-label="Play with sound">Play</button>'
         "</div>"
         f'<div class="lt-rail">{"".join(buttons)}</div>'
         "</header>",
         unsafe_allow_html=True,
     )
+
+
+def run_quick_action(action: str) -> None:
+    """One-tap Join / Board / Help without typing."""
+    user = st.session_state.get("user")
+    if not user or st.session_state.get("auth_state") != LOGGED_IN:
+        return
+    key = (action or "").strip().lower()
+    avatar = user_avatar(user)
+    if key == "join":
+        append_user("Join", avatar=avatar)
+        if not user_ai_enabled(user) and not is_admin(user):
+            append_assistant(
+                "Club game join is for gated-in members. "
+                "You can still check the **Board** for what’s coming up."
+            )
+            return
+        status, game = join_next_game(user.get("ig_handle") or "")
+        append_assistant(game_join_reply(status, game))
+        return
+    if key == "board":
+        append_user("Board", avatar=avatar)
+        append_assistant(games_board_markdown())
+        return
+    if key in {"help", "tips"}:
+        append_user("Help" if is_admin(user) else "Tips", avatar=avatar)
+        if is_admin(user):
+            append_assistant(admin_help_text())
+        else:
+            append_assistant(member_tips_text())
+        return
+
+
+def render_quick_actions() -> Optional[str]:
+    """Buttons above chat for logged-in members. Returns action key if clicked."""
+    if st.session_state.get("auth_state") != LOGGED_IN:
+        return None
+    user = st.session_state.get("user")
+    if not user:
+        return None
+    show_join = bool(user_ai_enabled(user) or is_admin(user))
+    labels = []
+    if show_join:
+        labels.append(("join", "🎾 Join"))
+    labels.append(("board", "📋 Board"))
+    labels.append(("help" if is_admin(user) else "tips", "✨ Help" if is_admin(user) else "✨ Tips"))
+    cols = st.columns(len(labels))
+    clicked = None
+    for col, (key, label) in zip(cols, labels):
+        with col:
+            if st.button(label, key=f"qa_{key}", use_container_width=True):
+                clicked = key
+    return clicked
 
 
 def render_messages() -> None:
@@ -8337,7 +8480,7 @@ def finish_pending_ig_scan() -> bool:
     worker = threading.Thread(target=_work, daemon=True)
     worker.start()
 
-    bar = st.progress(5, text="Loading… 5%")
+    bar = st.progress(8, text="Finding your court vibe…")
     t0 = time.time()
     almost_lines = (
         "Almost there…",
@@ -8348,12 +8491,12 @@ def finish_pending_ig_scan() -> bool:
     try:
         while not done["ok"]:
             elapsed = time.time() - t0
-            pct = min(92, max(5, int(5 + elapsed * 2.8)))
-            if elapsed >= 15:
+            pct = min(94, max(8, int(8 + elapsed * 5.5)))
+            if elapsed >= 8:
                 bar.progress(pct, text=f"{random.choice(almost_lines)} {pct}%")
             else:
-                bar.progress(pct, text=f"Loading… {pct}%")
-            time.sleep(1.2)
+                bar.progress(pct, text=f"Finding your court vibe… {pct}%")
+            time.sleep(0.45)
         worker.join(timeout=2)
     finally:
         bar.empty()
@@ -8457,9 +8600,8 @@ def handle_need_ig(text: str) -> None:
             )
             return
 
-    # Brand-new or incomplete re-scan — show sit-tight first, finish on next run
+    # Brand-new signup — scan starts on the next paint (progress bar, no extra sit-tight bubble)
     st.session_state["_ig_scan_handle"] = handle
-    append_assistant(_sit_tight_line(at))
 
 
 def handle_need_pin_signup(text: str) -> None:
@@ -8597,6 +8739,24 @@ def handle_logged_in(text: str) -> None:
         st.session_state.locked_handle = ""
         clear_login_cookie()
         append_assistant("Logged out. Drop an IG handle when you’re ready.")
+        return
+
+    # One-tap / typed shortcuts for everyone logged in
+    if lower in {"board", "games", "/games", "list games", "upcoming", "upcoming games"}:
+        append_assistant(games_board_markdown())
+        return
+    if lower in {"join", "join next", "join game", "sign up", "signup"}:
+        if not user_ai_enabled(user) and not is_admin(user):
+            append_assistant(
+                "Club game join is for gated-in members. "
+                "You can still check the **Board** for what’s coming up."
+            )
+            return
+        status, game = join_next_game(user.get("ig_handle") or "")
+        append_assistant(game_join_reply(status, game))
+        return
+    if lower in {"tips"} or (lower in {"help", "/help"} and not is_admin(user)):
+        append_assistant(member_tips_text())
         return
 
     # Admin commands: help, games, gate in/out, add game
@@ -8764,6 +8924,11 @@ def main() -> None:
     render_messages()
 
     if finish_pending_ig_scan():
+        st.rerun()
+
+    quick = render_quick_actions()
+    if quick:
+        run_quick_action(quick)
         st.rerun()
 
     prompt = st.chat_input(placeholder_for_state())
