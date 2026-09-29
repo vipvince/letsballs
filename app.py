@@ -85,6 +85,8 @@ _KNOWN_CREATORS: dict[str, dict[str, Any]] = {
 PIN_SALT = "letsballs-pin-v1"
 ADMIN_HANDLES = {"admin", "letsballs", "letsballs_admin", "vip", "ht___here"}
 DEFAULT_GAME_LOCATION = "Happy Valley"
+DEFAULT_GAME_SPOTS = 3
+GITHUB_MEDIA_BASE = "https://raw.githubusercontent.com/vipvince/letsballs/main"
 WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LqLATzTW38oEUKIcXxXiDw?s=cl&p=i&mlu=4&ilr=4"
 CHARACTER_HERO_MAX_PX = 560
 
@@ -349,9 +351,12 @@ ANIMAL_PHOTO_FILES.update({
 
 ANIMAL_NAMES = list(TENNIS_ANIMALS.keys())
 CLUB_AVATAR = os.path.join(AVATAR_DIR, "club_tennis.png")
-CLUB_TENNIS_FILE = "club_tennis.png"
-CLUB_TENNIS_LABEL = "club tennis"
-CLUB_TENNIS_EMOJI = "🎾"
+CLUB_TENNIS_FILE = "forehand_frog.png"
+CLUB_TENNIS_LABEL = "forehand frog"
+CLUB_TENNIS_EMOJI = "🐸"
+GATE_OUT_FILE = "forehand_frog.png"
+GATE_OUT_LABEL = "forehand frog"
+GATE_OUT_EMOJI = "🐸"
 
 # AI club chat: women clearly under 40 (nationality is not a gate)
 _ALLOWED_NAT_KEYS = (
@@ -429,6 +434,52 @@ EMOJI_AVATAR_RULES: list[dict[str, Any]] = [
         "boost": 12,
         "reason": "bunny emoji in bio",
     },
+    {
+        "emojis": ["🐸"],
+        "files": ["forehand_frog.png"],
+        "boost": 12,
+        "reason": "frog emoji in bio",
+    },
+    {
+        "emojis": ["📚", "📖"],
+        "files": ["bookworm_owl.png"],
+        "boost": 10,
+        "reason": "book emoji in bio",
+    },
+    {
+        "emojis": ["🎮"],
+        "files": ["gamer_hamster.png"],
+        "boost": 10,
+        "reason": "gamer emoji in bio",
+    },
+    {
+        "emojis": ["☕"],
+        "files": ["coffee_bear.png"],
+        "boost": 10,
+        "reason": "coffee emoji in bio",
+    },
+]
+
+# Extra bio phrases → avatar file (scored only against the IG bio / name)
+BIO_AVATAR_HINTS: list[tuple[tuple[str, ...], str, str]] = [
+    (("pilates", "yoga", "wellness", "meditation", "mindful"), "yoga_goat.png", "wellness words in bio"),
+    (("hike", "hiking", "trail", "mountain", "outdoors", "outdoor"), "peak_goat.png", "outdoors words in bio"),
+    (("run", "runner", "marathon", "running", "triathlon"), "runner_horse.png", "running words in bio"),
+    (("travel", "traveller", "traveler", "wanderlust", "digital nomad"), "travel_camel.png", "travel words in bio"),
+    (("coffee", "latte", "cafe", "café", "barista"), "coffee_bear.png", "coffee words in bio"),
+    (("chef", "cook", "cooking", "recipe", "foodie", "finedine"), "chef_pig.png", "food words in bio"),
+    (("bakery", "bread", "pastry", "croissant", "bake"), "bakery_mouse.png", "bakery words in bio"),
+    (("tea", "afternoon tea", "matcha"), "tea_bunny.png", "tea words in bio"),
+    (("surf", "surfing", "beach", "ocean"), "surf_dog.png", "beach/surf words in bio"),
+    (("dog", "puppy", "pup", "dog mum", "dog mom", "shiba"), "tennis_pug.png", "dog words in bio"),
+    (("cat", "kitten", "kitty", "meow"), "foodie_cat.png", "cat words in bio"),
+    (("panda",), "sleepy_panda.png", "panda in bio"),
+    (("koala",), "chill_koala.png", "koala in bio"),
+    (("gamer", "gaming", "twitch", "esport"), "gamer_hamster.png", "gamer words in bio"),
+    (("book", "reader", "reading", "writer"), "bookworm_owl.png", "book words in bio"),
+    (("party", "nightlife", "clubbing"), "party_parrot.png", "party words in bio"),
+    (("swim", "diving", "snorkel"), "slice_seal.png", "swim words in bio"),
+    (("frog",), "forehand_frog.png", "frog in bio"),
 ]
 
 # Auth flow states
@@ -1133,7 +1184,14 @@ def verify_pin(ig_handle: str, pin: str) -> Optional[dict]:
     return user
 
 
-def list_games(limit: int = 40) -> list[dict]:
+def list_games(limit: int = 40, include_past: bool = False) -> list[dict]:
+    # Short per-session cache — Streamlit reruns often hit this multiple times.
+    cache_key = f"_games_cache_{int(include_past)}_{limit}"
+    cached = st.session_state.get(cache_key)
+    cache_ts = float(st.session_state.get(f"{cache_key}_ts") or 0)
+    if cached is not None and (time.time() - cache_ts) < 20:
+        return list(cached)
+
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -1142,12 +1200,23 @@ def list_games(limit: int = 40) -> list[dict]:
             """,
             (limit,),
         ).fetchall()
-    return [_as_dict(r) for r in rows]
+    games = [_as_dict(r) for r in rows]
+    if not include_past:
+        games = [g for g in games if game_is_upcoming(g)]
+    st.session_state[cache_key] = list(games)
+    st.session_state[f"{cache_key}_ts"] = time.time()
+    return games
+
+
+def _invalidate_games_cache() -> None:
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("_games_cache"):
+            st.session_state.pop(key, None)
 
 
 def insert_game(
     when_text: str,
-    spots: int = 4,
+    spots: int = DEFAULT_GAME_SPOTS,
     location: str = "",
     notes: str = "",
     created_by: str = "admin",
@@ -1160,7 +1229,9 @@ def insert_game(
             """,
             (when_text.strip(), (location or "").strip(), max(1, int(spots)), notes.strip(), created_by),
         )
-        return int(cur.lastrowid)
+        gid = int(cur.lastrowid)
+    _invalidate_games_cache()
+    return gid
 
 
 def delete_game(game_id: int) -> tuple[bool, dict]:
@@ -1174,6 +1245,7 @@ def delete_game(game_id: int) -> tuple[bool, dict]:
             return False, {}
         conn.execute("DELETE FROM game_signups WHERE game_id = ?", (int(game_id),))
         conn.execute("DELETE FROM games WHERE id = ?", (int(game_id),))
+    _invalidate_games_cache()
     return True, _as_dict(row)
 
 
@@ -1188,10 +1260,10 @@ def admin_add_user(ig_handle: str, pin: str) -> tuple[str, dict]:
     if not re.fullmatch(r"\d{4}", pin or ""):
         return "bad", {}
     existing = get_user_by_handle(handle)
-    animal = "club tennis"
-    emoji = CLUB_TENNIS_EMOJI
+    animal = "tennis cat"
+    emoji = "🐱"
     vibe = "Added by admin."
-    avatar_path = CLUB_TENNIS_FILE
+    avatar_path = "crosscourt_cat.png"
     with get_conn() as conn:
         if existing:
             conn.execute(
@@ -1357,13 +1429,16 @@ def list_game_signups() -> list[dict]:
         )
         games = conn.execute(
             """
-            SELECT id, when_text, location, spots, notes
+            SELECT id, when_text, location, spots, notes, created_at
             FROM games
             ORDER BY id DESC
             """
         ).fetchall()
         out: list[dict] = []
         for g in games:
+            game = _as_dict(g)
+            if not game_is_upcoming(game):
+                continue
             rows = conn.execute(
                 """
                 SELECT ig_handle, created_at
@@ -1371,11 +1446,11 @@ def list_game_signups() -> list[dict]:
                 WHERE game_id = ?
                 ORDER BY id ASC
                 """,
-                (g["id"],),
+                (game["id"],),
             ).fetchall()
             out.append(
                 {
-                    **_as_dict(g),
+                    **game,
                     "signups": [_as_dict(r) for r in rows],
                 }
             )
@@ -1460,6 +1535,7 @@ def remove_game_signup(ig_handle: str, game_id: Optional[int] = None) -> tuple[s
             "SELECT id, when_text, location, spots FROM games WHERE id = ?",
             (row["id"],),
         ).fetchone()
+    _invalidate_games_cache()
     return "removed", _as_dict(updated) if updated else row
 
 
@@ -1551,7 +1627,7 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             )
         games = conn.execute(
             """
-            SELECT id, when_text, location, spots
+            SELECT id, when_text, location, spots, created_at
             FROM games
             ORDER BY id DESC
             """
@@ -1561,11 +1637,16 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
         target = None
         for game in games:
             game = _as_dict(game)
+            if not game_is_upcoming(game):
+                continue
             if int(game["spots"] or 0) > 0:
                 target = game
                 break
         if target is None:
-            return "full", _as_dict(games[0])
+            live = [ _as_dict(g) for g in games if game_is_upcoming(_as_dict(g)) ]
+            if not live:
+                return "none", {}
+            return "full", live[0]
         prior = conn.execute(
             """
             SELECT id FROM game_signups
@@ -1589,6 +1670,7 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             "SELECT id, when_text, location, spots FROM games WHERE id = ?",
             (target["id"],),
         ).fetchone()
+    _invalidate_games_cache()
     return "ok", _as_dict(updated)
 
 
@@ -1630,18 +1712,20 @@ def apply_admin_gate(ig_handle: str, eligible: bool) -> bool:
     return eligible if override is None else override
 
 
-def set_user_gate(ig_handle: str, enabled: bool) -> Optional[dict]:
+def set_user_gate(ig_handle: str, enabled: bool, animal_query: str = "") -> Optional[dict]:
     """Force a handle in or out of club chat. Creates a row if they have not signed up yet."""
     handle = normalize_handle(ig_handle)
     if not handle or not re.match(r"^[A-Za-z0-9._]{2,30}$", handle):
         return None
     flag = 1 if enabled else 0
+    avatar = resolve_pool_avatar(animal_query) if enabled and animal_query else None
     with get_conn() as conn:
         existing = conn.execute(
-            "SELECT id FROM users WHERE lower(ig_handle) = ?",
+            "SELECT id, animal, mascot, avatar_path FROM users WHERE lower(ig_handle) = ?",
             (handle,),
         ).fetchone()
-        if existing:
+        existing = _as_dict(existing) if existing else {}
+        if existing.get("id") is not None:
             conn.execute(
                 """
                 UPDATE users SET ai_enabled = ?, gate_override = ?, gate_detail = ? WHERE id = ?
@@ -1655,11 +1739,51 @@ def set_user_gate(ig_handle: str, enabled: bool) -> Optional[dict]:
                     existing["id"],
                 ),
             )
+            if not enabled:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET animal = ?, mascot = ?, animal_emoji = ?, avatar_path = ?,
+                        assign_why = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        GATE_OUT_LABEL,
+                        GATE_OUT_LABEL,
+                        GATE_OUT_EMOJI,
+                        GATE_OUT_FILE,
+                        "Admin gated out — assigned forehand frog.",
+                        existing["id"],
+                    ),
+                )
+            elif avatar:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET animal = ?, mascot = ?, animal_emoji = ?, avatar_path = ?,
+                        assign_why = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        avatar["label"],
+                        avatar["label"],
+                        avatar.get("emoji") or "🎾",
+                        avatar["file"],
+                        f"Admin gated in and assigned {avatar['label']}.",
+                        existing["id"],
+                    ),
+                )
         else:
+            animal = avatar["label"] if avatar else ("tennis cat" if enabled else GATE_OUT_LABEL)
+            emoji = (avatar.get("emoji") if avatar else ("🐱" if enabled else GATE_OUT_EMOJI))
+            file_name = avatar["file"] if avatar else ("crosscourt_cat.png" if enabled else GATE_OUT_FILE)
             conn.execute(
                 """
-                INSERT INTO users (ig_handle, pin_hash, ai_enabled, gate_override, gate_detail)
-                VALUES (?, NULL, ?, ?, ?)
+                INSERT INTO users (
+                    ig_handle, pin_hash, ai_enabled, gate_override, gate_detail,
+                    animal, mascot, animal_emoji, avatar_path, assign_why
+                )
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     handle,
@@ -1668,9 +1792,79 @@ def set_user_gate(ig_handle: str, enabled: bool) -> Optional[dict]:
                     "Admin forced in. The automatic check is ignored."
                     if enabled
                     else "Admin forced out. The automatic check is ignored. The 25% roll does not apply.",
+                    animal,
+                    animal,
+                    emoji,
+                    file_name,
+                    f"Admin created row and assigned {animal}.",
                 ),
             )
     return get_user_by_handle(handle)
+
+
+def resolve_pool_avatar(query: str) -> Optional[dict[str, Any]]:
+    """Match a pool portrait from a label, file name, or loose phrase."""
+    raw = re.sub(r"\s+", " ", (query or "").strip().lower())
+    raw = raw.lstrip("@")
+    if not raw:
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    slug = re.sub(r"\.png$", "", slug)
+    for p in AVATAR_POOL:
+        file_stem = re.sub(r"\.png$", "", (p.get("file") or "").lower())
+        label = (p.get("label") or "").lower()
+        if raw in {label, file_stem, (p.get("file") or "").lower()} or slug in {file_stem, label.replace(" ", "_")}:
+            return p
+        if slug and (slug in file_stem or slug in label.replace(" ", "_")):
+            return p
+    # last token / unique substring
+    for p in AVATAR_POOL:
+        label = (p.get("label") or "").lower()
+        file_stem = re.sub(r"\.png$", "", (p.get("file") or "").lower())
+        if raw in label or raw in file_stem.replace("_", " "):
+            return p
+    return None
+
+
+def admin_assign_animal(ig_handle: str, query: str) -> tuple[str, dict]:
+    """Assign a pool photo to a member. Returns ('ok'|'missing'|'bad', user)."""
+    handle = normalize_handle(ig_handle)
+    avatar = resolve_pool_avatar(query)
+    if not handle or not avatar:
+        return "bad", {}
+    user = get_user_by_handle(handle)
+    if not user:
+        return "missing", {}
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET animal = ?, mascot = ?, animal_emoji = ?, avatar_path = ?,
+                assign_why = ?
+            WHERE lower(ig_handle) = ?
+            """,
+            (
+                avatar["label"],
+                avatar["label"],
+                avatar.get("emoji") or "🎾",
+                avatar["file"],
+                f"Admin assigned {avatar['label']} ({avatar['file']}).",
+                handle,
+            ),
+        )
+    return "ok", get_user_by_handle(handle) or {}
+
+
+def animals_as_context() -> str:
+    seen: set[str] = set()
+    lines = ["**Animal photos** (use `assign @handle travel camel` or `gate in @handle as frog`)"]
+    for p in AVATAR_POOL:
+        fname = p.get("file") or ""
+        if fname in seen:
+            continue
+        seen.add(fname)
+        lines.append(f"- {p.get('label')} {p.get('emoji') or ''} — `{fname}`")
+    return "\n".join(lines)
 
 
 def reset_user_pin(ig_handle: str, pin: str) -> Optional[dict]:
@@ -1761,9 +1955,15 @@ def character_reveal(name: str, emoji: str) -> str:
 
 
 def admin_help_text() -> str:
+    turso_note = ""
+    if not using_durable_db():
+        turso_note = (
+            "\n\n_On Streamlit Cloud, add Turso secrets so deletes/signups survive reboots._"
+        )
     return (
         "**Admin commands**\n\n"
-        "1. **Add a game** — `Add game Sat 5pm 3 spots`\n"
+        f"1. **Add a game** — `Add game Sat 5pm` (defaults to **{DEFAULT_GAME_SPOTS} spots**; "
+        "the host is usually playing)\n"
         f"   Saved as **Sept 26 (Saturday) @ 5pm** style. Location defaults to **{DEFAULT_GAME_LOCATION}**.\n"
         "2. **Delete a game** — `delete game #3`\n"
         "   Removes the game and all its signups.\n"
@@ -1771,25 +1971,27 @@ def admin_help_text() -> str:
         "   Creates (or updates) a member with that PIN, gated in.\n"
         "4. **Delete a user** — `delete user @handle`\n"
         "   Removes the member and frees any held spots. Admin accounts are protected.\n"
-        "5. **Gate in** — `gate in @handle`\n"
-        "   Club chat, even if the automatic check would block them.\n"
-        "6. **Gate out** — `gate out @handle`\n"
-        "   Tennis stories only. No club chat.\n"
-        "7. **User** — `user @handle`\n"
+        "5. **Gate in** — `gate in @handle` or `gate in @handle as travel camel`\n"
+        "   Club chat. Optionally assign an animal photo at the same time.\n"
+        "6. **Assign animal** — `assign @handle forehand frog` or `assign @handle surf_dog.png`\n"
+        "   Swap their portrait. Type `animals` for the full list.\n"
+        "7. **Gate out** — `gate out @handle`\n"
+        "   Tennis stories only. They get **forehand frog**.\n"
+        "8. **User** — `user @handle`\n"
         "   Profile, why they are gated in or out (including the 25% roll), and why that character.\n"
-        "8. **List users** — `list users` or `users`\n"
+        "9. **List users** — `list users` or `users`\n"
         "   All members with gate / character / PIN status.\n"
-        "9. **Reset PIN** — `reset pin @handle 4821`\n"
+        "10. **Reset PIN** — `reset pin @handle 4821`\n"
         "   Sets a new 4-digit PIN.\n"
-        "10. **Board** — `games`\n"
-        "   List upcoming games.\n"
-        "11. **Signups** — `signups`\n"
-        "   Who registered for each game (@handles).\n"
-        "12. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
+        "11. **Board** — `games`\n"
+        "   List upcoming games (past dates are hidden).\n"
+        "12. **Signups** — `signups`\n"
+        "   Who registered for each upcoming game (@handles).\n"
+        "13. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
         "   Drop them from a game and put the spot back.\n"
-        "13. **Help** — `help` or `/help`\n"
-        "14. **Log out** — `logout`\n\n"
-        "_On Streamlit Cloud, add Turso secrets so deletes/signups survive reboots._"
+        "14. **Help** — `help` or `/help`\n"
+        "15. **Log out** — `logout`"
+        f"{turso_note}"
     )
 
 
@@ -1799,6 +2001,9 @@ def try_admin_command(text: str) -> bool:
     lower = raw.lower()
     if lower in {"help", "/help", "commands", "/commands"}:
         append_assistant(admin_help_text())
+        return True
+    if lower in {"animals", "/animals", "list animals", "avatars", "photos"}:
+        append_assistant(animals_as_context())
         return True
     if lower in {"games", "/games", "list games", "upcoming", "upcoming games"}:
         append_assistant(games_as_context())
@@ -1911,8 +2116,35 @@ def try_admin_command(text: str) -> bool:
         else:
             append_assistant(f"PIN for **@{handle}** is now `{pin}`.")
         return True
+    assign = re.fullmatch(
+        r"(?:/)?(?:assign|set)\s+(?:animal|photo|character|avatar)?\s*"
+        r"@?([A-Za-z0-9._]{2,30})\s+(.+)",
+        raw,
+        re.I,
+    )
+    if assign:
+        handle = normalize_handle(assign.group(1))
+        query = assign.group(2).strip()
+        status, user = admin_assign_animal(handle, query)
+        if status == "bad":
+            append_assistant(
+                "Couldn’t match that animal. Try `assign @handle travel camel` "
+                "or type `animals` for the list."
+            )
+        elif status == "missing":
+            append_assistant(f"No account for **@{handle}** yet. `gate in @{handle} as {query}` also works.")
+        else:
+            label = (user or {}).get("mascot") or (user or {}).get("animal") or query
+            emoji = (user or {}).get("animal_emoji") or ""
+            photo = animal_photo_path(label, (user or {}).get("avatar_path"))
+            append_assistant(
+                f"**@{handle}** is now **{label}** {emoji}.",
+                image=photo if isinstance(photo, str) and os.path.isfile(photo) else None,
+            )
+        return True
     m = re.fullmatch(
-        r"(?:/)?(?:gate|grant)\s+(in|out)\s+@?([A-Za-z0-9._]{2,30})",
+        r"(?:/)?(?:gate|grant)\s+(in|out)\s+@?([A-Za-z0-9._]{2,30})"
+        r"(?:\s+(?:as|to)\s+(.+))?",
         raw,
         re.I,
     )
@@ -1920,15 +2152,29 @@ def try_admin_command(text: str) -> bool:
         return False
     enabled = m.group(1).lower() == "in"
     handle = normalize_handle(m.group(2))
-    user = set_user_gate(handle, enabled)
+    animal_q = (m.group(3) or "").strip()
+    if animal_q and not enabled:
+        append_assistant("Animal photos are for gated-in members. Use `gate in @handle as …` or `assign`.")
+        return True
+    if animal_q and not resolve_pool_avatar(animal_q):
+        append_assistant(
+            f"Gating **@{handle}** in, but I don’t know “{animal_q}”. "
+            "Type `animals` for names. Use `assign @handle …` after."
+        )
+        animal_q = ""
+    user = set_user_gate(handle, enabled, animal_q)
     if not user:
         append_assistant("That handle doesn’t look right. Try `gate in @name`.")
         return True
     at = f"@{handle}"
     if enabled:
-        append_assistant(f"**{at}** is gated **in**. They get club chat on their next message.")
+        label = user.get("mascot") or user.get("animal") or ""
+        extra = f" Character: **{label}**." if label else ""
+        append_assistant(f"**{at}** is gated **in**. They get club chat on their next message.{extra}")
     else:
-        append_assistant(f"**{at}** is gated **out**. They only get tennis stories.")
+        append_assistant(
+            f"**{at}** is gated **out**. They only get tennis stories, with **forehand frog** 🐸."
+        )
     return True
 
 
@@ -4373,11 +4619,43 @@ def _looks_foodie(text: str) -> bool:
     return any(k in t for k in keys)
 
 
-def _score_avatar(pool_item: dict[str, Any], blob_lower: str, raw_text: str) -> tuple[int, list[str]]:
+def _extract_bio_blob(scraped: str, scrape: Optional[dict[str, Any]] = None) -> str:
+    """Pull biography / name text so animal matching leans on the IG bio."""
+    parts: list[str] = []
+    if isinstance(scrape, dict):
+        fields = list(scrape.get("fields") or [])
+        for prefix in ("biography:", "full_name:", "name:"):
+            val = _field_value(fields, prefix)
+            if val:
+                parts.append(val)
+        for em in scrape.get("emojis") or []:
+            if em:
+                parts.append(str(em))
+    text = scraped or ""
+    m = re.search(r"biography:\s*(.+?)(?:\s*\|\s*[a-z_]+:|\s*$)", text, re.I | re.S)
+    if m:
+        parts.append(m.group(1).strip())
+    m2 = re.search(r'on Instagram:\s*"([^"]+)"', text, re.I)
+    if m2:
+        parts.append(m2.group(1).strip())
+    # Keep a shorter slice of the full scrape as backup signal
+    if text:
+        parts.append(text[:900])
+    return "\n".join(parts)
+
+
+def _score_avatar(
+    pool_item: dict[str, Any],
+    blob_lower: str,
+    raw_text: str,
+    *,
+    bio_lower: str = "",
+) -> tuple[int, list[str]]:
     """Return (score, evidence bullets)."""
     score = 0
     evidence: list[str] = []
     file_name = pool_item["file"]
+    bio_l = bio_lower or blob_lower
 
     # Emoji rules get priority
     for rule in EMOJI_AVATAR_RULES:
@@ -4388,16 +4666,31 @@ def _score_avatar(pool_item: dict[str, Any], blob_lower: str, raw_text: str) -> 
             score += int(rule["boost"])
             evidence.append(f"emoji {''.join(hit)} → {rule['reason']} (+{rule['boost']})")
 
+    # Strong bio-phrase hints (prefer actual bio / name over the whole scrape blob)
+    for keywords, fname, reason in BIO_AVATAR_HINTS:
+        if fname != file_name:
+            continue
+        hit_kw = next((kw for kw in keywords if kw.lower() in bio_l), None)
+        if hit_kw:
+            score += 12
+            evidence.append(f"bio “{hit_kw}” → {reason} (+12)")
+            break
+
     for tag in pool_item.get("tags") or []:
         # Emoji tags must match exactly in raw text; word tags use lowercase blob
         if len(tag) <= 2 and not tag.isascii():
             # short CJK
-            if tag in (raw_text or "") or tag.lower() in blob_lower:
-                score += 3
-                evidence.append(f"keyword “{tag}”")
+            if tag in (raw_text or "") or tag.lower() in bio_l or tag.lower() in blob_lower:
+                bump = 5 if tag.lower() in bio_l else 3
+                score += bump
+                evidence.append(f"keyword “{tag}” (+{bump})")
         elif tag in (raw_text or ""):  # emoji tag
             score += 3
             evidence.append(f"tag “{tag}”")
+        elif tag.lower() in bio_l:
+            bump = 6 if len(tag) > 3 else 4
+            score += bump
+            evidence.append(f"bio tag “{tag}” (+{bump})")
         elif tag.lower() in blob_lower:
             bump = 2 if len(tag) > 3 else 1
             score += bump
@@ -4408,17 +4701,23 @@ def _score_avatar(pool_item: dict[str, Any], blob_lower: str, raw_text: str) -> 
     return score, evidence
 
 
-def _match_avatar_from_profile(scraped: str, handle: str) -> tuple[dict[str, Any], int, str, list[str]]:
+def _match_avatar_from_profile(
+    scraped: str,
+    handle: str,
+    scrape: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], int, str, list[str]]:
     """Pick a pre-generated avatar; return avatar, score, reason, evidence list."""
     raw = scraped or ""
-    blob = f"{raw} {handle}".lower()
+    bio_blob = _extract_bio_blob(raw, scrape)
+    bio_lower = bio_blob.lower()
+    blob = f"{bio_blob}\n{raw}\n{handle}".lower()
     available = [p for p in AVATAR_POOL if os.path.isfile(os.path.join(AVATAR_DIR, p["file"]))]
     if not available:
         available = list(AVATAR_POOL)
 
     scored: list[tuple[int, dict[str, Any], list[str]]] = []
     for p in available:
-        sc, ev = _score_avatar(p, blob, raw)
+        sc, ev = _score_avatar(p, blob, raw, bio_lower=bio_lower)
         scored.append((sc, p, ev))
     scored.sort(key=lambda x: (-x[0], x[1]["file"]))
     best_score, best, evidence = scored[0]
@@ -4440,13 +4739,18 @@ def _match_avatar_from_profile(scraped: str, handle: str) -> tuple[dict[str, Any
                 best, best_score, evidence = p, sc, ev
                 break
 
-    if any("emoji" in e for e in evidence):
+    if any("bio" in e.lower() for e in evidence):
+        reason = next(
+            (re.sub(r"\s*\(\+\d+\)\s*$", "", e.split("→", 1)[-1]).strip() for e in evidence if "bio" in e.lower()),
+            f"bio fit for “{best['label']}”",
+        )
+    elif any("emoji" in e for e in evidence):
         raw_reason = next((e.split("→", 1)[-1].strip() for e in evidence if "emoji" in e), "emoji match")
         reason = re.sub(r"\s*\(\+\d+\)\s*$", "", raw_reason).strip()
-    elif any(t in blob for t in ("cat", "貓")) and _looks_foodie(blob):
-        reason = "cat lover + foodie keywords"
-    elif any(t in blob for t in ("travel", "traveller", "旅")):
-        reason = "travel keywords in bio/web crumbs"
+    elif any(t in bio_lower for t in ("cat", "貓")) and _looks_foodie(bio_lower):
+        reason = "cat lover + foodie keywords in bio"
+    elif any(t in bio_lower for t in ("travel", "traveller", "旅")):
+        reason = "travel keywords in bio"
     else:
         reason = f"best keyword fit for “{best['label']}”"
 
@@ -4538,6 +4842,7 @@ def assign_animal_and_vibe(
     avatar, score, reason, evidence = _match_avatar_from_profile(
         f"{scraped}\n{photo_blob}".strip(),
         handle,
+        scrape=scrape,
     )
     emoji = avatar.get("emoji") or "🎾"
     avatar_path = avatar["file"]
@@ -6111,13 +6416,13 @@ def character_why_for_admin(user: dict) -> str:
 
 
 def assign_club_tennis() -> tuple[str, str, str, str, str]:
-    """Fallback identity: club ball avatar (looks like a normal assignment)."""
+    """Fallback identity for gated-out members: forehand frog."""
     return (
-        CLUB_TENNIS_LABEL,
-        "Here’s your **club tennis** ball — let’s get you a PIN and onto the court.",
-        CLUB_TENNIS_EMOJI,
-        CLUB_TENNIS_LABEL,
-        CLUB_TENNIS_FILE,
+        GATE_OUT_LABEL,
+        "Here’s your **forehand frog** — let’s get you a PIN and onto the court.",
+        GATE_OUT_EMOJI,
+        GATE_OUT_LABEL,
+        GATE_OUT_FILE,
     )
 
 
@@ -6411,6 +6716,108 @@ def format_game_when_text(raw: str, *, now: Optional[datetime] = None) -> str:
     return cleaned
 
 
+def _parse_created_at(raw: Any) -> Optional[datetime]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    cleaned = text.replace("Z", "").split("+")[0].split(".")[0].strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(cleaned[:19] if "T" in fmt or " " in fmt else cleaned[:10], fmt)
+        except Exception:
+            continue
+    m = re.match(r"(\d{4})-(\d{1,2})-(\d{1,2})", cleaned)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def game_when_datetime(game: dict, *, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Best-effort datetime for a stored game row (for past/upcoming filtering)."""
+    now = now or datetime.now()
+    when = str((game or {}).get("when_text") or "")
+    if not when.strip():
+        return None
+
+    month = None
+    day = None
+    m_md = re.search(
+        r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|"
+        r"dec(?:ember)?)\.?\s+(\d{1,2})\b",
+        when,
+        re.I,
+    )
+    if m_md:
+        month = _month_from_token(m_md.group(1))
+        day = int(m_md.group(2))
+    else:
+        m_dm = re.search(
+            r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+            r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            r"jul(?:y)?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|"
+            r"dec(?:ember)?)\.?\b",
+            when,
+            re.I,
+        )
+        if m_dm:
+            day = int(m_dm.group(1))
+            month = _month_from_token(m_dm.group(2))
+
+    created = _parse_created_at((game or {}).get("created_at"))
+    time_bits = _extract_game_time(when)
+
+    if month and day:
+        years: list[int] = []
+        for y in (
+            created.year if created else None,
+            now.year,
+            (created.year + 1) if created else now.year + 1,
+            now.year - 1,
+        ):
+            if y and y not in years:
+                years.append(y)
+        candidates: list[datetime] = []
+        for y in years:
+            try:
+                candidates.append(datetime(y, month, day))
+            except ValueError:
+                continue
+        if not candidates:
+            return None
+        if created:
+            after = [c for c in candidates if c.date() >= (created.date() - timedelta(days=1))]
+            pick = min(after or candidates, key=lambda c: abs((c - created).days))
+        else:
+            # Prefer the candidate closest to today (past or future)
+            pick = min(candidates, key=lambda c: abs((c.date() - now.date()).days))
+    else:
+        # Weekday-only / fuzzy: resolve from "today" anchor without rolling a finished date forward
+        pick = _resolve_game_date(when, now=created or now)
+        if pick is None:
+            return None
+        # If weekday resolve landed in the future but created_at is after that weekday last week, keep as-is
+
+    if time_bits:
+        hour24, minute, _label = time_bits
+        pick = pick.replace(hour=hour24, minute=minute, second=0, microsecond=0)
+    else:
+        pick = pick.replace(hour=23, minute=59, second=0, microsecond=0)
+    return pick
+
+
+def game_is_upcoming(game: dict, *, now: Optional[datetime] = None) -> bool:
+    """True when the game's calendar day is today or later. Unknown dates stay visible."""
+    now = now or datetime.now()
+    dt = game_when_datetime(game, now=now)
+    if dt is None:
+        return True
+    return dt.date() >= now.date()
+
+
 def format_game_card(when_text: str, spots: Any, location: str = "") -> str:
     """Member-facing line: 'Sept 26 (Saturday) @ 5pm - 3 spots' (+ location)."""
     when = (when_text or "").strip() or "TBD"
@@ -6443,12 +6850,12 @@ def parse_add_game(text: str) -> Optional[dict]:
                         "content": (
                             "Parse tennis game admin commands. Return ONLY JSON: "
                             '{"action":"add_game"|"none","when_text":"date and time together",'
-                            '"location":"...","spots":4,"notes":"..."}. '
+                            f'"location":"...","spots":{DEFAULT_GAME_SPOTS},"notes":"..."}}. '
                             "when_text must include both a date (weekday or calendar date) and a time "
                             "(e.g. 'Sept 26 5pm' or 'Sat 3pm'). Do not include spots in when_text. "
-                            "spots is required for add_game. "
+                            f"If spots is missing, use {DEFAULT_GAME_SPOTS} (host usually plays). "
                             "If location is missing, use an empty string. "
-                            "Example input: Add game Sat 3pm 4 spots Happy Valley"
+                            f"Example input: Add game Sat 5pm {DEFAULT_GAME_LOCATION}"
                         ),
                     },
                     {"role": "user", "content": text},
@@ -6523,7 +6930,7 @@ def _heuristic_add_game(text: str) -> Optional[dict]:
 
 
 def finalize_add_game(parsed: dict) -> tuple[Optional[dict], Optional[str]]:
-    """Validate add-game fields. Location defaults to Happy Valley."""
+    """Validate add-game fields. Location defaults to Happy Valley; spots default to 3."""
     when_text = (parsed.get("when_text") or "").strip()
     location = (parsed.get("location") or "").strip() or DEFAULT_GAME_LOCATION
     spots_set = bool(parsed.get("spots_set"))
@@ -6533,20 +6940,22 @@ def finalize_add_game(parsed: dict) -> tuple[Optional[dict], Optional[str]]:
         spots = 0
         spots_set = False
 
+    if not spots_set or spots < 1:
+        spots = DEFAULT_GAME_SPOTS
+        spots_set = True
+
     missing: list[str] = []
     if not when_text or not _GAME_DATE_RE.search(when_text):
         missing.append("date")
     if not when_text or not _GAME_TIME_RE.search(when_text):
         missing.append("time")
-    if not spots_set or spots < 1:
-        missing.append("spots")
 
     if missing:
         need = ", ".join(f"**{m}**" for m in missing)
         return None, (
-            f"Almost — still need {need}. Location defaults to **{DEFAULT_GAME_LOCATION}** "
-            "if you skip it.\n\n"
-            f"Example: `Add game Sat 3pm 4 spots {DEFAULT_GAME_LOCATION}`"
+            f"Almost — still need {need}. Spots default to **{DEFAULT_GAME_SPOTS}**, "
+            f"location to **{DEFAULT_GAME_LOCATION}**.\n\n"
+            f"Example: `Add game Sat 5pm`"
         )
 
     return {
@@ -6609,6 +7018,114 @@ def ensure_session() -> None:
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    try_restore_login()
+
+
+LOGIN_COOKIE = "ppt_login"
+LOGIN_COOKIE_DAYS = 30
+
+
+def _cookie_manager():
+    """Browser cookie helper (survives refresh). Optional dependency."""
+    if st.session_state.get("_cookie_mgr") is not None:
+        return st.session_state.get("_cookie_mgr")
+    try:
+        import extra_streamlit_components as stx
+
+        mgr = stx.CookieManager(key="ppt_cookie_mgr")
+        st.session_state["_cookie_mgr"] = mgr
+        return mgr
+    except Exception:
+        st.session_state["_cookie_mgr"] = False
+        return None
+
+
+def _session_token(user: dict) -> str:
+    handle = normalize_handle(user.get("ig_handle") or "")
+    pin_hash = user.get("pin_hash") or ""
+    return hashlib.sha256(f"{PIN_SALT}:sess:{handle}:{pin_hash}".encode("utf-8")).hexdigest()[:28]
+
+
+def persist_login(user: Optional[dict]) -> None:
+    """Remember this member for ~30 days so refresh skips the PIN prompt."""
+    if not user or not user.get("pin_hash"):
+        return
+    handle = normalize_handle(user.get("ig_handle") or "")
+    if not handle:
+        return
+    payload = f"{handle}.{_session_token(user)}"
+    mgr = _cookie_manager()
+    if not mgr:
+        return
+    try:
+        mgr.set(
+            LOGIN_COOKIE,
+            payload,
+            expires_at=datetime.now() + timedelta(days=LOGIN_COOKIE_DAYS),
+        )
+    except Exception:
+        pass
+
+
+def clear_login_cookie() -> None:
+    mgr = _cookie_manager()
+    if not mgr:
+        return
+    try:
+        mgr.delete(LOGIN_COOKIE)
+    except Exception:
+        pass
+
+
+def try_restore_login() -> bool:
+    """If a valid login cookie exists, restore LOGGED_IN without asking for PIN."""
+    if st.session_state.get("auth_state") == LOGGED_IN and st.session_state.get("user"):
+        return False
+
+    mgr = _cookie_manager()
+    raw = None
+    if mgr:
+        try:
+            raw = mgr.get(LOGIN_COOKIE)
+        except Exception:
+            raw = None
+    # CookieManager needs one run to hydrate — don't lock restore out forever.
+    if mgr and raw is None and not st.session_state.get("_cookie_bootstrapped"):
+        st.session_state["_cookie_bootstrapped"] = True
+        return False
+
+    if st.session_state.get("_login_restore_checked"):
+        return False
+    st.session_state["_login_restore_checked"] = True
+
+    if not raw:
+        try:
+            raw = (st.context.cookies or {}).get(LOGIN_COOKIE)
+        except Exception:
+            raw = None
+    if not raw or "." not in str(raw):
+        return False
+
+    handle, token = str(raw).split(".", 1)
+    handle = normalize_handle(handle)
+    user = get_user_by_handle(handle)
+    if not user or not user.get("pin_hash"):
+        clear_login_cookie()
+        return False
+    if token != _session_token(user):
+        clear_login_cookie()
+        return False
+
+    st.session_state.user = user
+    st.session_state.auth_state = LOGGED_IN
+    st.session_state.pending_handle = handle
+    st.session_state.handle_locked = False
+    st.session_state.locked_handle = ""
+    if not st.session_state.messages:
+        animal = user.get("mascot") or user.get("animal") or "player"
+        emoji = user.get("animal_emoji") or "🎾"
+        append_assistant(f"Welcome back, **{animal}** {emoji} — you’re still signed in.")
+    return True
 
 
 def assistant_avatar() -> str:
@@ -6670,20 +7187,53 @@ def _file_to_data_uri(path: str) -> str:
 _MEDIA_URI_CACHE: dict[str, str] = {}
 
 
-def _hosted_media_url(path: str) -> str:
-    """Inline a local image or video so the hosted site can show it.
-
-    Streamlit Community Cloud answers /app/static/... with a login redirect,
-    so a video or img pointed there stays blank even after you open the app.
-    """
-    if not path or not os.path.isfile(path):
+def _repo_rel_media(path: str) -> str:
+    """Return 'static/...' or 'avatars/...' relative path for GitHub raw URLs."""
+    if not path:
         return ""
-    cached = _MEDIA_URI_CACHE.get(path)
+    abs_path = os.path.abspath(path)
+    for root, prefix in (
+        (os.path.abspath(STATIC_DIR), "static"),
+        (os.path.abspath(AVATAR_DIR), "avatars"),
+    ):
+        try:
+            common = os.path.commonpath([abs_path, root])
+        except ValueError:
+            continue
+        if common == root:
+            rel = os.path.relpath(abs_path, root).replace("\\", "/")
+            return f"{prefix}/{rel}"
+    return ""
+
+
+def _hosted_media_url(path: str) -> str:
+    """Serve media via GitHub raw (fast) with local data-URI fallback.
+
+    Embedding video/poster as base64 on every Streamlit rerun is very slow on Cloud.
+    """
+    if not path:
+        return ""
+    abs_path = path if os.path.isabs(path) else os.path.join(AVATAR_DIR, path)
+    if not os.path.isfile(abs_path):
+        # Still allow GitHub URL when the file exists on the repo even if missing locally
+        rel_guess = _repo_rel_media(abs_path) or _repo_rel_media(path)
+        if rel_guess:
+            return f"{GITHUB_MEDIA_BASE}/{rel_guess}"
+        return ""
+
+    cached = _MEDIA_URI_CACHE.get(abs_path)
     if cached:
         return cached
-    uri = _file_to_data_uri(path)
+
+    rel = _repo_rel_media(abs_path)
+    if rel:
+        url = f"{GITHUB_MEDIA_BASE}/{rel}"
+        _MEDIA_URI_CACHE[abs_path] = url
+        return url
+
+    uri = _file_to_data_uri(abs_path)
     if uri:
-        _MEDIA_URI_CACHE[path] = uri
+        _MEDIA_URI_CACHE[abs_path] = uri
     return uri
 
 
@@ -6716,7 +7266,7 @@ def render_character_hero(path: str) -> None:
     full = resolve_media_path(path)
     if not full:
         return
-    uri = _file_to_data_uri(full)
+    uri = _hosted_media_url(full)
     if not uri:
         return
     st.markdown(
@@ -7297,7 +7847,7 @@ def render_little_tennis_header() -> None:
         '<header class="lt-head">'
         '<p class="lt-brand">www.playplaytennis.com</p>'
         '<div class="lt-stage">'
-        f'<video class="lt-film" playsinline preload="auto"{poster_attr}{src_attr}></video>'
+        f'<video class="lt-film" playsinline preload="metadata"{poster_attr}{src_attr}></video>'
         '<button type="button" class="lt-sound" aria-pressed="true" aria-label="Mute sound">Mute</button>'
         "</div>"
         f'<div class="lt-rail">{"".join(buttons)}</div>'
@@ -7376,6 +7926,8 @@ def guest_tennis_story_reply(user_text: str = "", remind_ig: bool = True) -> str
 def bootstrap_greeting() -> None:
     if st.session_state.messages:
         return
+    if st.session_state.get("auth_state") == LOGGED_IN and st.session_state.get("user"):
+        return
     append_assistant(
         "Hey — welcome to www.playplaytennis.com.\n\n"
         "Drop your Instagram handle with an **@**."
@@ -7401,7 +7953,7 @@ def _begin_pin_signup(
     scrape: dict[str, Any],
     eligible: bool,
 ) -> None:
-    """Shared PIN signup prompt — same surface UX for AI and gated tennis-ball members."""
+    """Shared PIN signup prompt — same surface UX for AI and gated members."""
     st.session_state.pending_handle = handle
     st.session_state.pending_animal = display_name
     st.session_state.pending_vibe = vibe
@@ -7519,7 +8071,7 @@ def _prepare_ig_signup(handle: str) -> dict[str, Any]:
     else:
         display_name, vibe, emoji, mascot, avatar_path = assign_club_tennis()
         ai_flag = 0
-        assign_why = "Club tennis ball — the gate kept them out, so they did not get a matched animal."
+        assign_why = "Forehand frog — the gate kept them out, so they did not get a matched animal."
 
     upsert_pending_user(
         handle,
@@ -7763,6 +8315,7 @@ def handle_need_pin_signup(text: str) -> None:
     rewrite_last_user("****")
     st.session_state.user = user
     st.session_state.auth_state = LOGGED_IN
+    persist_login(user)
     animal = user.get("mascot") or user.get("animal") or "player"
     emoji = user.get("animal_emoji") or "🎾"
     if not user_ai_enabled(user):
@@ -7795,6 +8348,7 @@ def handle_need_pin_login(text: str) -> None:
             return
         st.session_state.auth_state = NEED_IG
         st.session_state.pending_handle = ""
+        clear_login_cookie()
         append_assistant("Cool — what’s your Instagram handle?")
         return
 
@@ -7814,6 +8368,7 @@ def handle_need_pin_login(text: str) -> None:
         return
     st.session_state.user = user
     st.session_state.auth_state = LOGGED_IN
+    persist_login(user)
     animal = user.get("mascot") or user.get("animal") or "player"
     emoji = user.get("animal_emoji") or "🎾"
     if not user_ai_enabled(user):
@@ -7840,6 +8395,7 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     # Refresh from DB so seeded character (e.g. Court Shiba) shows immediately
     fresh = get_user_by_handle(user.get("ig_handle") or "") or user
     st.session_state.user = fresh
+    persist_login(fresh)
     animal = fresh.get("mascot") or fresh.get("animal") or "player"
     emoji = fresh.get("animal_emoji") or "🎾"
     invite = maybe_game_invite() if user_ai_enabled(fresh) else ""
@@ -7878,6 +8434,7 @@ def handle_logged_in(text: str) -> None:
         st.session_state.pending_handle = ""
         st.session_state.handle_locked = False
         st.session_state.locked_handle = ""
+        clear_login_cookie()
         append_assistant("Logged out. Drop an IG handle when you’re ready.")
         return
 
