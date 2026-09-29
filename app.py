@@ -1,6 +1,6 @@
 """
 letsballs.com — conversational tennis club chat
-Streamlit + SQLite + IG scrape + DeepSeek (strict tennis-only)
+Streamlit + SQLite + IG scrape + DeepSeek (tennis-focused club chat)
 """
 
 from __future__ import annotations
@@ -231,11 +231,16 @@ _MASC_GIVEN = {
 
 SYSTEM_PROMPT = (
     "You are a tennis club assistant for www.playplaytennis.com. "
-    "You MUST ONLY discuss tennis, game schedules, and the club. "
-    "If the user asks about ANY other topic (programming, news, weather, etc.), "
-    "politely refuse and pivot back to tennis. Keep answers concise. "
-    "Only mention a game that is on the schedule you are given. "
-    "If there is no game, say there is no game. "
+    "Your world is tennis — broadly. Chat freely about anything tennis-related: "
+    "club schedules and spots, hitting partners, technique, drills, fitness for tennis, "
+    "racquets and strings (Yonex, Wilson, Babolat, etc.), shoes, bags, balls, "
+    "where to buy gear, court surfaces, rules, pro tennis, and weather for outdoor play. "
+    "Weather, gear shopping, racquet talk, and Japan tennis shops are all on-topic. "
+    "Only refuse topics with no tennis link (e.g. coding, politics, crypto, unrelated news). "
+    "When refusing, be brief and invite a tennis angle. Keep answers concise and friendly. "
+    "Only mention a scheduled club game that appears in the schedule you are given. "
+    "If there is no game on the board, say there is no game. "
+    "Never invent club games, signups, or members. "
     "Never promise to flag, notify, ping, watch, or message them later — "
     "this chat is not always open, so a future alert is not something you can do."
 )
@@ -6479,14 +6484,15 @@ def local_tennis_reply(user_text: str) -> str:
     off_topic = any(
         w in lower
         for w in (
-            "python", "code", "program", "weather", "news", "stock", "bitcoin",
-            "recipe", "politics", "movie",
+            "python", "javascript", "coding", "program ", "programming",
+            "stock", "bitcoin", "crypto", "politics", "election",
+            "netflix", "movie review",
         )
     )
     if off_topic:
         return (
-            "I only talk tennis, schedules, and the club. "
-            "Ask me what’s on the board or how many spots are left."
+            "I’m here for tennis — club games, gear, courts, weather for play, the lot. "
+            "What’s on your mind court-side?"
         )
     if not games:
         return (
