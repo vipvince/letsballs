@@ -7018,25 +7018,20 @@ def ensure_session() -> None:
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
-    try_restore_login()
 
 
 LOGIN_COOKIE = "ppt_login"
 LOGIN_COOKIE_DAYS = 30
+LOGIN_QUERY_KEY = "ppt"
 
 
 def _cookie_manager():
-    """Browser cookie helper (survives refresh). Optional dependency."""
-    if st.session_state.get("_cookie_mgr") is not None:
-        return st.session_state.get("_cookie_mgr")
+    """Fresh CookieManager each run (required by extra-streamlit-components)."""
     try:
         import extra_streamlit_components as stx
 
-        mgr = stx.CookieManager(key="ppt_cookie_mgr")
-        st.session_state["_cookie_mgr"] = mgr
-        return mgr
+        return stx.CookieManager(key="ppt_cookie_mgr_v2")
     except Exception:
-        st.session_state["_cookie_mgr"] = False
         return None
 
 
@@ -7046,14 +7041,135 @@ def _session_token(user: dict) -> str:
     return hashlib.sha256(f"{PIN_SALT}:sess:{handle}:{pin_hash}".encode("utf-8")).hexdigest()[:28]
 
 
+def _login_payload(user: dict) -> str:
+    handle = normalize_handle(user.get("ig_handle") or "")
+    return f"{handle}.{_session_token(user)}"
+
+
+def _parse_login_payload(raw: Any) -> Optional[tuple[str, str]]:
+    text = str(raw or "").strip()
+    if not text or "." not in text:
+        return None
+    handle, token = text.split(".", 1)
+    handle = normalize_handle(handle)
+    token = (token or "").strip()
+    if not handle or not token:
+        return None
+    return handle, token
+
+
+def _query_login_value() -> Optional[str]:
+    try:
+        raw = st.query_params.get(LOGIN_QUERY_KEY)
+    except Exception:
+        try:
+            raw = (st.experimental_get_query_params() or {}).get(LOGIN_QUERY_KEY)
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+        except Exception:
+            return None
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else None
+    text = str(raw or "").strip()
+    return text or None
+    try:
+        st.query_params[LOGIN_QUERY_KEY] = payload
+    except Exception:
+        try:
+            st.experimental_set_query_params(**{LOGIN_QUERY_KEY: payload})
+        except Exception:
+            pass
+
+
+def _clear_login_query() -> None:
+    try:
+        if LOGIN_QUERY_KEY in st.query_params:
+            del st.query_params[LOGIN_QUERY_KEY]
+    except Exception:
+        try:
+            st.experimental_set_query_params()
+        except Exception:
+            pass
+
+
+def _sync_login_local_storage(payload: Optional[str]) -> None:
+    """Mirror login into browser localStorage (survives refresh even when cookies flake)."""
+    try:
+        import streamlit.components.v1 as components
+
+        if payload:
+            components.html(
+                f"""
+                <script>
+                try {{ localStorage.setItem({json.dumps(LOGIN_COOKIE)}, {json.dumps(payload)}); }} catch (e) {{}}
+                </script>
+                """,
+                height=0,
+            )
+        else:
+            components.html(
+                f"""
+                <script>
+                try {{ localStorage.removeItem({json.dumps(LOGIN_COOKIE)}); }} catch (e) {{}}
+                </script>
+                """,
+                height=0,
+            )
+    except Exception:
+        pass
+
+
+def _promote_local_storage_login() -> None:
+    """
+    If the URL has no login token, ask the browser to copy localStorage → ?ppt=…
+    Runs once per browser tab session.
+    """
+    try:
+        current = _query_login_value()
+    except Exception:
+        current = None
+    if current or st.session_state.get("_ppt_ls_promoted"):
+        return
+    st.session_state["_ppt_ls_promoted"] = True
+    try:
+        import streamlit.components.v1 as components
+
+        components.html(
+            f"""
+            <script>
+            (function() {{
+              try {{
+                var v = localStorage.getItem({json.dumps(LOGIN_COOKIE)});
+                if (!v) return;
+                var key = {json.dumps(LOGIN_QUERY_KEY)};
+                var apply = function(loc) {{
+                  try {{
+                    var u = new URL(loc.href);
+                    if (u.searchParams.get(key)) return;
+                    u.searchParams.set(key, v);
+                    loc.replace(u.toString());
+                  }} catch (e) {{}}
+                }};
+                apply(window.location);
+                if (window.parent && window.parent !== window) apply(window.parent.location);
+              }} catch (e) {{}}
+            }})();
+            </script>
+            """,
+            height=0,
+        )
+    except Exception:
+        pass
+
+
 def persist_login(user: Optional[dict]) -> None:
-    """Remember this member for ~30 days so refresh skips the PIN prompt."""
+    """Remember this member so refresh / new tab can skip the PIN prompt."""
     if not user or not user.get("pin_hash"):
         return
-    handle = normalize_handle(user.get("ig_handle") or "")
-    if not handle:
-        return
-    payload = f"{handle}.{_session_token(user)}"
+    payload = _login_payload(user)
+    st.session_state["_ppt_login_payload"] = payload
+    _set_login_query(payload)
+    _sync_login_local_storage(payload)
     mgr = _cookie_manager()
     if not mgr:
         return
@@ -7068,6 +7184,9 @@ def persist_login(user: Optional[dict]) -> None:
 
 
 def clear_login_cookie() -> None:
+    st.session_state.pop("_ppt_login_payload", None)
+    _clear_login_query()
+    _sync_login_local_storage(None)
     mgr = _cookie_manager()
     if not mgr:
         return
@@ -7077,37 +7196,64 @@ def clear_login_cookie() -> None:
         pass
 
 
+def _apply_restored_user(user: dict) -> None:
+    handle = normalize_handle(user.get("ig_handle") or "")
+    st.session_state.user = user
+    st.session_state.auth_state = LOGGED_IN
+    st.session_state.pending_handle = handle
+    st.session_state.handle_locked = False
+    st.session_state.locked_handle = ""
+    # Drop the cold-start greeting if it already printed before restore finished
+    msgs = st.session_state.get("messages") or []
+    if len(msgs) == 1 and msgs[0].get("role") == "assistant":
+        content = str(msgs[0].get("content") or "")
+        if "Drop your Instagram handle" in content:
+            st.session_state.messages = []
+    if not st.session_state.messages:
+        animal = user.get("mascot") or user.get("animal") or "player"
+        emoji = user.get("animal_emoji") or "🎾"
+        append_assistant(f"Welcome back, **{animal}** {emoji} — you’re still signed in.")
+
+
 def try_restore_login() -> bool:
-    """If a valid login cookie exists, restore LOGGED_IN without asking for PIN."""
+    """Restore LOGGED_IN from query param, cookie, or in-memory payload."""
     if st.session_state.get("auth_state") == LOGGED_IN and st.session_state.get("user"):
-        return False
+        return True
+
+    _promote_local_storage_login()
 
     mgr = _cookie_manager()
-    raw = None
-    if mgr:
+    cookies: dict[str, Any] = {}
+    if mgr is not None:
         try:
-            raw = mgr.get(LOGIN_COOKIE)
+            cookies = mgr.get_all() or {}
         except Exception:
-            raw = None
-    # CookieManager needs one run to hydrate — don't lock restore out forever.
-    if mgr and raw is None and not st.session_state.get("_cookie_bootstrapped"):
-        st.session_state["_cookie_bootstrapped"] = True
-        return False
+            cookies = {}
+        # Component often needs a second run to hydrate the jar
+        if not st.session_state.get("_ppt_cookie_hydrated"):
+            st.session_state["_ppt_cookie_hydrated"] = True
+            if not cookies and not _query_login_value() and not st.session_state.get(
+                "_ppt_login_payload"
+            ):
+                st.session_state["_ppt_cookie_rerun"] = True
+                return False
 
-    if st.session_state.get("_login_restore_checked"):
-        return False
-    st.session_state["_login_restore_checked"] = True
-
+    raw = (
+        st.session_state.get("_ppt_login_payload")
+        or _query_login_value()
+        or cookies.get(LOGIN_COOKIE)
+    )
     if not raw:
         try:
             raw = (st.context.cookies or {}).get(LOGIN_COOKIE)
         except Exception:
             raw = None
-    if not raw or "." not in str(raw):
+
+    parsed = _parse_login_payload(raw)
+    if not parsed:
         return False
 
-    handle, token = str(raw).split(".", 1)
-    handle = normalize_handle(handle)
+    handle, token = parsed
     user = get_user_by_handle(handle)
     if not user or not user.get("pin_hash"):
         clear_login_cookie()
@@ -7116,15 +7262,11 @@ def try_restore_login() -> bool:
         clear_login_cookie()
         return False
 
-    st.session_state.user = user
-    st.session_state.auth_state = LOGGED_IN
-    st.session_state.pending_handle = handle
-    st.session_state.handle_locked = False
-    st.session_state.locked_handle = ""
-    if not st.session_state.messages:
-        animal = user.get("mascot") or user.get("animal") or "player"
-        emoji = user.get("animal_emoji") or "🎾"
-        append_assistant(f"Welcome back, **{animal}** {emoji} — you’re still signed in.")
+    st.session_state["_ppt_login_payload"] = f"{handle}.{token}"
+    _apply_restored_user(user)
+    # Keep URL + storage in sync for the next refresh
+    _set_login_query(f"{handle}.{token}")
+    _sync_login_local_storage(f"{handle}.{token}")
     return True
 
 
@@ -8575,6 +8717,9 @@ def main() -> None:
     )
     init_db()
     ensure_session()
+    try_restore_login()
+    if st.session_state.pop("_ppt_cookie_rerun", None):
+        st.rerun()
     inject_styles()
     render_little_tennis_header()
 
