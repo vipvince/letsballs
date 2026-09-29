@@ -7023,16 +7023,27 @@ def ensure_session() -> None:
 LOGIN_COOKIE = "ppt_login"
 LOGIN_COOKIE_DAYS = 30
 LOGIN_QUERY_KEY = "ppt"
+LOGIN_MAX_AGE = LOGIN_COOKIE_DAYS * 24 * 60 * 60
 
 
-def _cookie_manager():
-    """Fresh CookieManager each run (required by extra-streamlit-components)."""
+def init_login_cookie_manager():
+    """
+    Mount CookieManager once per script run (must be called from main()).
+    Reuse this same instance for get/set — duplicate keys break persistence.
+    """
+    cm = None
     try:
         import extra_streamlit_components as stx
 
-        return stx.CookieManager(key="ppt_cookie_mgr_v2")
+        cm = stx.CookieManager(key="ppt_login_cm")
     except Exception:
-        return None
+        cm = None
+    st.session_state["_ppt_cm_live"] = cm
+    return cm
+
+
+def _live_cookie_manager():
+    return st.session_state.get("_ppt_cm_live")
 
 
 def _session_token(user: dict) -> str:
@@ -7095,93 +7106,98 @@ def _clear_login_query() -> None:
             pass
 
 
-def _sync_login_local_storage(payload: Optional[str]) -> None:
-    """Mirror login into browser localStorage (survives refresh even when cookies flake)."""
+def _http_cookie_value() -> Optional[str]:
+    """Cookies sent with the Streamlit request (survives tab close on the same PC)."""
+    try:
+        cookies = st.context.cookies
+        if cookies is None:
+            return None
+        raw = cookies.get(LOGIN_COOKIE)
+        if isinstance(raw, (list, tuple)):
+            raw = raw[0] if raw else None
+        text = str(raw or "").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def _write_browser_cookie_js(payload: Optional[str]) -> None:
+    """Also set/clear a first-party cookie via JS (backup for CookieManager)."""
     try:
         import streamlit.components.v1 as components
 
         if payload:
-            components.html(
-                f"""
-                <script>
-                try {{ localStorage.setItem({json.dumps(LOGIN_COOKIE)}, {json.dumps(payload)}); }} catch (e) {{}}
-                </script>
-                """,
-                height=0,
-            )
-        else:
-            components.html(
-                f"""
-                <script>
-                try {{ localStorage.removeItem({json.dumps(LOGIN_COOKIE)}); }} catch (e) {{}}
-                </script>
-                """,
-                height=0,
-            )
-    except Exception:
-        pass
-
-
-def _promote_local_storage_login() -> None:
-    """
-    If the URL has no login token, ask the browser to copy localStorage → ?ppt=…
-    Runs once per browser tab session.
-    """
-    try:
-        current = _query_login_value()
-    except Exception:
-        current = None
-    if current or st.session_state.get("_ppt_ls_promoted"):
-        return
-    st.session_state["_ppt_ls_promoted"] = True
-    try:
-        import streamlit.components.v1 as components
-
-        components.html(
-            f"""
+            # SameSite=Lax + Secure so it sticks on HTTPS Streamlit Cloud
+            js = f"""
             <script>
             (function() {{
+              var name = {json.dumps(LOGIN_COOKIE)};
+              var val = encodeURIComponent({json.dumps(payload)});
+              var maxAge = {int(LOGIN_MAX_AGE)};
+              var cookie = name + "=" + val + "; path=/; max-age=" + maxAge + "; SameSite=Lax; Secure";
+              try {{ document.cookie = cookie; }} catch (e) {{}}
               try {{
-                var v = localStorage.getItem({json.dumps(LOGIN_COOKIE)});
-                if (!v) return;
-                var key = {json.dumps(LOGIN_QUERY_KEY)};
-                var apply = function(loc) {{
-                  try {{
-                    var u = new URL(loc.href);
-                    if (u.searchParams.get(key)) return;
-                    u.searchParams.set(key, v);
-                    loc.replace(u.toString());
-                  }} catch (e) {{}}
-                }};
-                apply(window.location);
-                if (window.parent && window.parent !== window) apply(window.parent.location);
+                if (window.parent && window.parent !== window) {{
+                  window.parent.document.cookie = cookie;
+                }}
               }} catch (e) {{}}
+              try {{ localStorage.setItem(name, {json.dumps(payload)}); }} catch (e) {{}}
             }})();
             </script>
-            """,
-            height=0,
-        )
+            """
+        else:
+            js = f"""
+            <script>
+            (function() {{
+              var name = {json.dumps(LOGIN_COOKIE)};
+              var dead = name + "=; path=/; max-age=0; SameSite=Lax; Secure";
+              try {{ document.cookie = dead; }} catch (e) {{}}
+              try {{
+                if (window.parent && window.parent !== window) {{
+                  window.parent.document.cookie = dead;
+                }}
+              }} catch (e) {{}}
+              try {{ localStorage.removeItem(name); }} catch (e) {{}}
+            }})();
+            </script>
+            """
+        components.html(js, height=0)
     except Exception:
         pass
 
 
 def persist_login(user: Optional[dict]) -> None:
-    """Remember this member so refresh / new tab can skip the PIN prompt."""
+    """Remember this member on this browser for ~30 days (tab close OK)."""
     if not user or not user.get("pin_hash"):
         return
     payload = _login_payload(user)
     st.session_state["_ppt_login_payload"] = payload
     _set_login_query(payload)
-    _sync_login_local_storage(payload)
-    mgr = _cookie_manager()
-    if not mgr:
+    _write_browser_cookie_js(payload)
+    cm = _live_cookie_manager()
+    if not cm:
         return
     try:
-        mgr.set(
+        cm.set(
             LOGIN_COOKIE,
             payload,
             expires_at=datetime.now() + timedelta(days=LOGIN_COOKIE_DAYS),
+            max_age=LOGIN_MAX_AGE,
+            path="/",
+            same_site="Lax",
+            secure=True,
         )
+    except TypeError:
+        # Older CookieManager without same_site/secure kwargs
+        try:
+            cm.set(
+                LOGIN_COOKIE,
+                payload,
+                expires_at=datetime.now() + timedelta(days=LOGIN_COOKIE_DAYS),
+                path="/",
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -7189,12 +7205,12 @@ def persist_login(user: Optional[dict]) -> None:
 def clear_login_cookie() -> None:
     st.session_state.pop("_ppt_login_payload", None)
     _clear_login_query()
-    _sync_login_local_storage(None)
-    mgr = _cookie_manager()
-    if not mgr:
+    _write_browser_cookie_js(None)
+    cm = _live_cookie_manager()
+    if not cm:
         return
     try:
-        mgr.delete(LOGIN_COOKIE)
+        cm.delete(LOGIN_COOKIE)
     except Exception:
         pass
 
@@ -7206,7 +7222,6 @@ def _apply_restored_user(user: dict) -> None:
     st.session_state.pending_handle = handle
     st.session_state.handle_locked = False
     st.session_state.locked_handle = ""
-    # Drop the cold-start greeting if it already printed before restore finished
     msgs = st.session_state.get("messages") or []
     if len(msgs) == 1 and msgs[0].get("role") == "assistant":
         content = str(msgs[0].get("content") or "")
@@ -7218,39 +7233,30 @@ def _apply_restored_user(user: dict) -> None:
         append_assistant(f"Welcome back, **{animal}** {emoji} — you’re still signed in.")
 
 
-def try_restore_login() -> bool:
-    """Restore LOGGED_IN from query param, cookie, or in-memory payload."""
+def try_restore_login(cookie_map: Optional[dict] = None) -> bool:
+    """Restore LOGGED_IN from HTTP cookie / CookieManager / query param."""
     if st.session_state.get("auth_state") == LOGGED_IN and st.session_state.get("user"):
         return True
 
-    _promote_local_storage_login()
-
-    mgr = _cookie_manager()
-    cookies: dict[str, Any] = {}
-    if mgr is not None:
-        try:
-            cookies = mgr.get_all() or {}
-        except Exception:
-            cookies = {}
-        # Component often needs a second run to hydrate the jar
-        if not st.session_state.get("_ppt_cookie_hydrated"):
-            st.session_state["_ppt_cookie_hydrated"] = True
-            if not cookies and not _query_login_value() and not st.session_state.get(
-                "_ppt_login_payload"
-            ):
-                st.session_state["_ppt_cookie_rerun"] = True
-                return False
+    cookie_map = cookie_map if cookie_map is not None else {}
+    cm = _live_cookie_manager()
 
     raw = (
         st.session_state.get("_ppt_login_payload")
+        or _http_cookie_value()
         or _query_login_value()
-        or cookies.get(LOGIN_COOKIE)
+        or (cookie_map.get(LOGIN_COOKIE) if isinstance(cookie_map, dict) else None)
     )
-    if not raw:
-        try:
-            raw = (st.context.cookies or {}).get(LOGIN_COOKIE)
-        except Exception:
-            raw = None
+
+    # CookieManager jar often empty on the first run of a new tab — one hydrate rerun.
+    if (
+        not raw
+        and cm is not None
+        and not st.session_state.get("_ppt_cookie_hydrated")
+    ):
+        st.session_state["_ppt_cookie_hydrated"] = True
+        st.session_state["_ppt_cookie_rerun"] = True
+        return False
 
     parsed = _parse_login_payload(raw)
     if not parsed:
@@ -7267,9 +7273,8 @@ def try_restore_login() -> bool:
 
     st.session_state["_ppt_login_payload"] = f"{handle}.{token}"
     _apply_restored_user(user)
-    # Keep URL + storage in sync for the next refresh
-    _set_login_query(f"{handle}.{token}")
-    _sync_login_local_storage(f"{handle}.{token}")
+    # Refresh cookie expiry so it keeps lasting on this PC
+    persist_login(user)
     return True
 
 
@@ -8720,7 +8725,14 @@ def main() -> None:
     )
     init_db()
     ensure_session()
-    try_restore_login()
+    cm = init_login_cookie_manager()
+    cookie_map: dict[str, Any] = {}
+    if cm is not None:
+        try:
+            cookie_map = cm.get_all() or {}
+        except Exception:
+            cookie_map = {}
+    try_restore_login(cookie_map)
     if st.session_state.pop("_ppt_cookie_rerun", None):
         st.rerun()
     inject_styles()
