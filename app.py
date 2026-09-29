@@ -1442,8 +1442,8 @@ def games_board_markdown() -> str:
 def member_tips_text() -> str:
     return (
         "**Quick tips**\n\n"
-        "- **Join** — grab the next open spot\n"
-        "- **Board** — see upcoming games\n"
+        "- **Games** — see upcoming sessions (when an admin has posted them)\n"
+        "- **Join** — grab the next open spot (only shows when a game has spots)\n"
         "- Ask about racquets, weather, courts — tennis talk is welcome\n"
         "- Type `logout` to switch accounts"
     )
@@ -8126,7 +8126,7 @@ def run_quick_action(action: str) -> None:
         append_assistant(game_join_reply(status, game))
         return
     if key == "board":
-        append_user("Board", avatar=avatar)
+        append_user("Games", avatar=avatar)
         append_assistant(games_board_markdown())
         return
     if key in {"help", "tips"}:
@@ -8145,12 +8145,19 @@ def render_quick_actions() -> Optional[str]:
     user = st.session_state.get("user")
     if not user:
         return None
-    show_join = bool(user_ai_enabled(user) or is_admin(user))
-    labels = []
-    if show_join:
+
+    upcoming = list_games()
+    open_games = [g for g in upcoming if int(g.get("spots") or 0) > 0]
+    can_join = bool(open_games) and bool(user_ai_enabled(user) or is_admin(user))
+
+    labels: list[tuple[str, str]] = []
+    # Only offer Join / Games when there is something on the schedule
+    if can_join:
         labels.append(("join", "🎾 Join"))
-    labels.append(("board", "📋 Board"))
+    if upcoming:
+        labels.append(("board", "🎾 Games"))
     labels.append(("help" if is_admin(user) else "tips", "✨ Help" if is_admin(user) else "✨ Tips"))
+
     cols = st.columns(len(labels))
     clicked = None
     for col, (key, label) in zip(cols, labels):
