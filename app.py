@@ -85,7 +85,7 @@ _KNOWN_CREATORS: dict[str, dict[str, Any]] = {
 PIN_SALT = "letsballs-pin-v1"
 ADMIN_HANDLES = {"admin", "letsballs", "letsballs_admin", "vip", "ht___here"}
 DEFAULT_GAME_LOCATION = "Happy Valley"
-DEFAULT_GAME_SPOTS = 3
+DEFAULT_GAME_SPOTS = 4
 GITHUB_MEDIA_BASE = "https://raw.githubusercontent.com/vipvince/letsballs/main"
 WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LqLATzTW38oEUKIcXxXiDw?s=cl&p=i&mlu=4&ilr=4"
 CHARACTER_HERO_MAX_PX = 560
@@ -934,6 +934,17 @@ def _db_schema_ready() -> bool:
 def init_db() -> None:
     os.makedirs(PROFILE_DIR, exist_ok=True)
     _db_schema_ready()
+    _ensure_creator_signups()
+
+
+@st.cache_resource(show_spinner=False)
+def _ensure_creator_signups() -> bool:
+    """Once per process: register game creators who are missing from signups."""
+    try:
+        backfill_creator_signups()
+    except Exception:
+        pass
+    return True
 
 
 def _pragma_signup_cols(conn) -> set[str]:
@@ -1226,17 +1237,112 @@ def insert_game(
     notes: str = "",
     created_by: str = "admin",
 ) -> int:
+    """
+    Create a game. `spots` is total headcount (default 4).
+    The creator is auto-signed up; remaining open spots become total - 1.
+    """
+    creator = normalize_handle(created_by)
+    total = max(1, int(spots))
+    open_spots = max(0, total - 1) if creator else total
     with get_conn() as conn:
         cur = conn.execute(
             """
             INSERT INTO games (when_text, location, spots, notes, created_by)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (when_text.strip(), (location or "").strip(), max(1, int(spots)), notes.strip(), created_by),
+            (
+                when_text.strip(),
+                (location or "").strip(),
+                open_spots,
+                notes.strip(),
+                creator,
+            ),
         )
         gid = int(cur.lastrowid)
+        if creator:
+            try:
+                conn.execute(
+                    "INSERT INTO game_signups (game_id, ig_handle, admin_seen) VALUES (?, ?, 1)",
+                    (gid, creator),
+                )
+            except Exception:
+                pass
     _invalidate_games_cache()
     return gid
+
+
+def set_game_spots(game_id: int, spots: int) -> tuple[bool, dict]:
+    """Admin: set remaining open spots for a game (0 = full)."""
+    try:
+        n = max(0, int(spots))
+    except (TypeError, ValueError):
+        return False, {}
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, when_text, location, spots FROM games WHERE id = ?",
+            (int(game_id),),
+        ).fetchone()
+        if not row:
+            return False, {}
+        conn.execute("UPDATE games SET spots = ? WHERE id = ?", (n, int(game_id)))
+        updated = conn.execute(
+            "SELECT id, when_text, location, spots FROM games WHERE id = ?",
+            (int(game_id),),
+        ).fetchone()
+    _invalidate_games_cache()
+    return True, _as_dict(updated) if updated else _as_dict(row)
+
+
+def fill_game(game_id: int) -> tuple[bool, dict]:
+    """Admin: mark a game full (0 spots left)."""
+    return set_game_spots(game_id, 0)
+
+
+def backfill_creator_signups() -> int:
+    """
+    One-time-ish fix: ensure each game's created_by is registered as a signup.
+    Does not change open spots (legacy games already reserved the host outside the count).
+    """
+    fixed = 0
+    with get_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_signups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id INTEGER NOT NULL,
+                ig_handle TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                admin_seen INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(game_id, ig_handle)
+            )
+            """
+        )
+        games = conn.execute(
+            "SELECT id, created_by, spots FROM games ORDER BY id ASC"
+        ).fetchall()
+        for g in games:
+            game = _as_dict(g)
+            creator = normalize_handle(game.get("created_by") or "")
+            if not creator:
+                continue
+            gid = int(game["id"])
+            prior = conn.execute(
+                "SELECT id FROM game_signups WHERE game_id = ? AND lower(ig_handle) = ?",
+                (gid, creator),
+            ).fetchone()
+            if prior:
+                continue
+            try:
+                conn.execute(
+                    "INSERT INTO game_signups (game_id, ig_handle, admin_seen) VALUES (?, ?, 1)",
+                    (gid, creator),
+                )
+                fixed += 1
+            except Exception:
+                pass
+    if fixed:
+        _invalidate_games_cache()
+    return fixed
 
 
 def delete_game(game_id: int) -> tuple[bool, dict]:
@@ -1998,35 +2104,39 @@ def admin_help_text() -> str:
         )
     return (
         "**Admin commands**\n\n"
-        f"1. **Add a game** — `Add game Sat 5pm` (defaults to **{DEFAULT_GAME_SPOTS} spots**; "
-        "the host is usually playing)\n"
+        f"1. **Add a game** — `Add game Sat 5pm` (defaults to **{DEFAULT_GAME_SPOTS} pax**; "
+        "you are auto-signed as player 1)\n"
         f"   Saved as **Sept 26 (Saturday) @ 5pm** style. Location defaults to **{DEFAULT_GAME_LOCATION}**.\n"
-        "2. **Delete a game** — `delete game #3`\n"
+        "2. **Fill / full** — `full game #3` or `fill game #3`\n"
+        "   Mark the game full (0 spots left / fill the headcount).\n"
+        "3. **Set spots** — `spots #3 2` or `amend game #3 spots 2`\n"
+        "   Set remaining open spots (use `0` to fill).\n"
+        "4. **Delete a game** — `delete game #3`\n"
         "   Removes the game and all its signups.\n"
-        "3. **Add a user** — `add user @handle 4821`\n"
+        "5. **Add a user** — `add user @handle 4821`\n"
         "   Creates (or updates) a member with that PIN, gated in.\n"
-        "4. **Delete a user** — `delete user @handle`\n"
+        "6. **Delete a user** — `delete user @handle`\n"
         "   Removes the member and frees any held spots. Admin accounts are protected.\n"
-        "5. **Gate in** — `gate in @handle` or `gate in @handle as travel camel`\n"
+        "7. **Gate in** — `gate in @handle` or `gate in @handle as travel camel`\n"
         "   Club chat. Optionally assign an animal photo at the same time.\n"
-        "6. **Assign animal** — `assign @handle forehand frog` or `assign @handle surf_dog.png`\n"
+        "8. **Assign animal** — `assign @handle forehand frog` or `assign @handle surf_dog.png`\n"
         "   Swap their portrait. Type `animals` for the full list.\n"
-        "7. **Gate out** — `gate out @handle`\n"
+        "9. **Gate out** — `gate out @handle`\n"
         "   Tennis stories only. They get **forehand frog**.\n"
-        "8. **User** — `user @handle`\n"
+        "10. **User** — `user @handle`\n"
         "   Profile, why they are gated in or out (including the 25% roll), and why that character.\n"
-        "9. **List users** — `list users` or `users`\n"
+        "11. **List users** — `list users` or `users`\n"
         "   All members with gate / character / PIN status.\n"
-        "10. **Reset PIN** — `reset pin @handle 4821`\n"
+        "12. **Reset PIN** — `reset pin @handle 4821`\n"
         "   Sets a new 4-digit PIN.\n"
-        "11. **Board** — `games`\n"
+        "13. **Board** — `games`\n"
         "   List upcoming games (past dates are hidden).\n"
-        "12. **Signups** — `signups`\n"
+        "14. **Signups** — `signups`\n"
         "   Who registered for each upcoming game (@handles).\n"
-        "13. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
+        "15. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
         "   Drop them from a game and put the spot back.\n"
-        "14. **Help** — `help` or `/help`\n"
-        "15. **Log out** — `logout`"
+        "16. **Help** — `help` or `/help`\n"
+        "17. **Log out** — `logout`"
         f"{turso_note}"
     )
 
@@ -2081,6 +2191,56 @@ def try_admin_command(text: str) -> bool:
             when = game.get("when_text") or f"#{gid}"
             loc = game.get("location") or DEFAULT_GAME_LOCATION
             append_assistant(f"Deleted game **#{gid}** — {when} @ {loc}.")
+        return True
+    fill_game_cmd = re.fullmatch(
+        r"(?:/)?"
+        r"(?:(?:full|fill|close)\s+(?:up\s+)?(?:the\s+)?(?:hc\s+)?(?:game\s+)?#?(\d+)"
+        r"|(?:mark\s+)?(?:game\s+)?#?(\d+)\s+(?:full|filled|closed)"
+        r"|fill\s+(?:up\s+)?(?:the\s+)?hc\s+(?:for\s+)?(?:game\s+)?#?(\d+))",
+        raw,
+        re.I,
+    )
+    if fill_game_cmd:
+        gid = int(next(g for g in fill_game_cmd.groups() if g))
+        ok, game = fill_game(gid)
+        if not ok:
+            append_assistant(f"No game **#{gid}** on the board.")
+        else:
+            when = game.get("when_text") or f"#{gid}"
+            loc = game.get("location") or DEFAULT_GAME_LOCATION
+            append_assistant(
+                f"**#{gid}** is full — {when} @ {loc}. **0** spots left."
+            )
+        return True
+    set_spots = re.fullmatch(
+        r"(?:/)?"
+        r"(?:(?:set\s+)?spots\s+(?:(?:for\s+)?(?:game\s+)?#?(\d+)\s+(\d+)|(\d+)\s+(?:for\s+)?(?:game\s+)?#?(\d+))"
+        r"|amend\s+(?:game\s+)?#?(\d+)\s+spots\s+(\d+))",
+        raw,
+        re.I,
+    )
+    if set_spots:
+        g1, s1, s2, g2, g3, s3 = set_spots.groups()
+        if g3 is not None:
+            gid, n = int(g3), int(s3)
+        elif g1 is not None:
+            gid, n = int(g1), int(s1)
+        else:
+            gid, n = int(g2), int(s2)
+        ok, game = set_game_spots(gid, n)
+        if not ok:
+            append_assistant(f"No game **#{gid}** on the board.")
+        else:
+            when = game.get("when_text") or f"#{gid}"
+            loc = game.get("location") or DEFAULT_GAME_LOCATION
+            left = int(game.get("spots") or 0)
+            if left == 0:
+                append_assistant(f"**#{gid}** is full — {when} @ {loc}.")
+            else:
+                spot_bit = "1 spot" if left == 1 else f"{left} spots"
+                append_assistant(
+                    f"Updated **#{gid}** — {when} @ {loc} · **{spot_bit}** open."
+                )
         return True
     add_user = re.fullmatch(
         r"(?:/)?add\s+user\s+@?([A-Za-z0-9._]{2,30})\s+(\d{4})",
@@ -6890,7 +7050,7 @@ def parse_add_game(text: str) -> Optional[dict]:
                             f'"location":"...","spots":{DEFAULT_GAME_SPOTS},"notes":"..."}}. '
                             "when_text must include both a date (weekday or calendar date) and a time "
                             "(e.g. 'Sept 26 5pm' or 'Sat 3pm'). Do not include spots in when_text. "
-                            f"If spots is missing, use {DEFAULT_GAME_SPOTS} (host usually plays). "
+                            f"If spots is missing, use {DEFAULT_GAME_SPOTS} (total pax; host auto-joins). "
                             "If location is missing, use an empty string. "
                             f"Example input: Add game Sat 5pm {DEFAULT_GAME_LOCATION}"
                         ),
@@ -6967,7 +7127,7 @@ def _heuristic_add_game(text: str) -> Optional[dict]:
 
 
 def finalize_add_game(parsed: dict) -> tuple[Optional[dict], Optional[str]]:
-    """Validate add-game fields. Location defaults to Happy Valley; spots default to 3."""
+    """Validate add-game fields. Location defaults to Happy Valley; slots default to 4 pax."""
     when_text = (parsed.get("when_text") or "").strip()
     location = (parsed.get("location") or "").strip() or DEFAULT_GAME_LOCATION
     spots_set = bool(parsed.get("spots_set"))
@@ -6990,8 +7150,8 @@ def finalize_add_game(parsed: dict) -> tuple[Optional[dict], Optional[str]]:
     if missing:
         need = ", ".join(f"**{m}**" for m in missing)
         return None, (
-            f"Almost — still need {need}. Spots default to **{DEFAULT_GAME_SPOTS}**, "
-            f"location to **{DEFAULT_GAME_LOCATION}**.\n\n"
+            f"Almost — still need {need}. Headcount defaults to **{DEFAULT_GAME_SPOTS} pax** "
+            f"(you auto-join as #1), location to **{DEFAULT_GAME_LOCATION}**.\n\n"
             f"Example: `Add game Sat 5pm`"
         )
 
@@ -8107,6 +8267,16 @@ def render_little_tennis_header() -> None:
     )
 
 
+def short_game_when(when_text: str, max_len: int = 22) -> str:
+    """Compact when_text for button labels: drop weekday parens, trim length."""
+    when = (when_text or "").strip()
+    when = re.sub(r"\s*\([^)]*\)", "", when)
+    when = re.sub(r"\s+", " ", when).strip()
+    if len(when) > max_len:
+        when = when[: max_len - 1].rstrip() + "…"
+    return when or "next game"
+
+
 def run_quick_action(action: str) -> None:
     """One-tap Join / Board / Help without typing."""
     user = st.session_state.get("user")
@@ -8115,7 +8285,9 @@ def run_quick_action(action: str) -> None:
     key = (action or "").strip().lower()
     avatar = user_avatar(user)
     if key == "join":
-        append_user("Join", avatar=avatar)
+        open_g = next((g for g in list_games() if int(g.get("spots") or 0) > 0), None)
+        when_bit = short_game_when((open_g or {}).get("when_text") or "")
+        append_user(f"Join {when_bit}", avatar=avatar)
         if not user_ai_enabled(user) and not is_admin(user):
             append_assistant(
                 "Club game join is for gated-in members. "
@@ -8153,7 +8325,8 @@ def render_quick_actions() -> Optional[str]:
     labels: list[tuple[str, str]] = []
     # Only offer Join / Games when there is something on the schedule
     if can_join:
-        labels.append(("join", "🎾 Join"))
+        when_bit = short_game_when(open_games[0].get("when_text") or "")
+        labels.append(("join", f"🎾 Join {when_bit}"))
     if upcoming:
         labels.append(("board", "🎾 Games"))
     labels.append(("help" if is_admin(user) else "tips", "✨ Help" if is_admin(user) else "✨ Tips"))
@@ -8777,16 +8950,19 @@ def handle_logged_in(text: str) -> None:
                 append_assistant(err)
                 return
             assert game is not None
+            total = int(game["spots"])
+            open_left = max(0, total - 1)
             gid = insert_game(
                 when_text=game["when_text"],
                 location=game["location"],
-                spots=game["spots"],
+                spots=total,
                 notes=game.get("notes", ""),
                 created_by=normalize_handle(user.get("ig_handle", "admin")),
             )
             append_assistant(
                 f"Game added ✅ **#{gid}** — "
-                f"{format_game_card(game['when_text'], game['spots'], game['location'])}"
+                f"{format_game_card(game['when_text'], open_left, game['location'])}\n"
+                f"You’re signed in as player **1** of **{total}**."
             )
             return
 
