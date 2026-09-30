@@ -944,6 +944,10 @@ def _ensure_creator_signups() -> bool:
         backfill_creator_signups()
     except Exception:
         pass
+    try:
+        normalize_stored_game_whens()
+    except Exception:
+        pass
     return True
 
 
@@ -1305,18 +1309,6 @@ def backfill_creator_signups() -> int:
     """
     fixed = 0
     with get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS game_signups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                game_id INTEGER NOT NULL,
-                ig_handle TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                admin_seen INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(game_id, ig_handle)
-            )
-            """
-        )
         games = conn.execute(
             "SELECT id, created_by, spots FROM games ORDER BY id ASC"
         ).fetchall()
@@ -1340,6 +1332,28 @@ def backfill_creator_signups() -> int:
                 fixed += 1
             except Exception:
                 pass
+    if fixed:
+        _invalidate_games_cache()
+    return fixed
+
+
+def normalize_stored_game_whens() -> int:
+    """Rewrite game when_text rows to 'Oct 3 (Saturday) @ 6pm' style."""
+    fixed = 0
+    with get_conn() as conn:
+        rows = conn.execute("SELECT id, when_text FROM games").fetchall()
+        for r in rows:
+            game = _as_dict(r)
+            raw = (game.get("when_text") or "").strip()
+            if not raw:
+                continue
+            polished = format_game_when_text(raw)
+            if polished and polished != raw:
+                conn.execute(
+                    "UPDATE games SET when_text = ? WHERE id = ?",
+                    (polished, int(game["id"])),
+                )
+                fixed += 1
     if fixed:
         _invalidate_games_cache()
     return fixed
@@ -1521,7 +1535,7 @@ def games_as_context() -> str:
         lines.append(
             f"- #{g['id']}: {format_game_card(g.get('when_text') or '', g.get('spots'), loc)}{notes}"
         )
-    return "Scheduled games (live from database):\n" + "\n".join(lines)
+    return "Scheduled games:\n" + "\n".join(lines)
 
 
 def games_board_markdown() -> str:
@@ -1531,7 +1545,7 @@ def games_board_markdown() -> str:
         return "No upcoming games on the board yet."
     blocks = ["**Upcoming games**"]
     for g in games:
-        when = (g.get("when_text") or "TBD").strip()
+        when = format_game_when_text((g.get("when_text") or "TBD").strip()) or "TBD"
         loc = (g.get("location") or DEFAULT_GAME_LOCATION).strip()
         try:
             spots = int(g.get("spots") or 0)
@@ -1616,7 +1630,7 @@ def signups_as_context() -> str:
             continue
         names = "\n".join(f"- @{s['ig_handle']}" for s in people)
         blocks.append(f"{header}\n{names}")
-    return "**Game signups (live from database)**\n\n" + "\n\n".join(blocks)
+    return "**Game signups**\n\n" + "\n\n".join(blocks)
 
 
 def remove_game_signup(ig_handle: str, game_id: Optional[int] = None) -> tuple[str, dict]:
@@ -1817,7 +1831,7 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
 
 
 def game_join_reply(status: str, game: dict) -> str:
-    when = (game or {}).get("when_text") or "the next session"
+    when = format_game_when_text((game or {}).get("when_text") or "") or "the next session"
     loc = (game or {}).get("location") or DEFAULT_GAME_LOCATION
     wa = f"[Join the WhatsApp group]({WHATSAPP_GROUP_URL})"
     if status == "none":
@@ -7017,7 +7031,7 @@ def game_is_upcoming(game: dict, *, now: Optional[datetime] = None) -> bool:
 
 def format_game_card(when_text: str, spots: Any, location: str = "") -> str:
     """Member-facing line: 'Sept 26 (Saturday) @ 5pm - 3 spots' (+ location)."""
-    when = (when_text or "").strip() or "TBD"
+    when = format_game_when_text((when_text or "").strip()) or "TBD"
     try:
         n = int(spots)
         spot_bit = f"{n} spot" if n == 1 else f"{n} spots"
@@ -8269,7 +8283,7 @@ def render_little_tennis_header() -> None:
 
 def short_game_when(when_text: str, max_len: int = 22) -> str:
     """Compact when_text for button labels: drop weekday parens, trim length."""
-    when = (when_text or "").strip()
+    when = format_game_when_text((when_text or "").strip())
     when = re.sub(r"\s*\([^)]*\)", "", when)
     when = re.sub(r"\s+", " ", when).strip()
     if len(when) > max_len:
