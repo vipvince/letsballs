@@ -1216,13 +1216,15 @@ def list_games(limit: int = 40, include_past: bool = False) -> list[dict]:
         rows = conn.execute(
             """
             SELECT id, when_text, location, spots, notes, created_by, created_at
-            FROM games ORDER BY id DESC LIMIT ?
-            """,
-            (limit,),
+            FROM games
+            """
         ).fetchall()
     games = [_as_dict(r) for r in rows]
     if not include_past:
         games = [g for g in games if game_is_upcoming(g)]
+    games = sort_games_chronologically(games)
+    if limit and len(games) > limit:
+        games = games[: int(limit)]
     st.session_state[cache_key] = list(games)
     st.session_state[f"{cache_key}_ts"] = time.time()
     return games
@@ -1570,7 +1572,7 @@ def member_tips_text() -> str:
 
 
 def list_game_signups() -> list[dict]:
-    """Games with the Instagram handles that held a spot, newest game first."""
+    """Upcoming games with signup handles, soonest first."""
     with get_conn() as conn:
         conn.execute(
             """
@@ -1587,7 +1589,6 @@ def list_game_signups() -> list[dict]:
             """
             SELECT id, when_text, location, spots, notes, created_at
             FROM games
-            ORDER BY id DESC
             """
         ).fetchall()
         out: list[dict] = []
@@ -1610,7 +1611,7 @@ def list_game_signups() -> list[dict]:
                     "signups": [_as_dict(r) for r in rows],
                 }
             )
-    return out
+    return sort_games_chronologically(out)
 
 
 def signups_as_context() -> str:
@@ -1781,27 +1782,24 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             conn.execute(
                 "ALTER TABLE game_signups ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"
             )
-        games = conn.execute(
-            """
-            SELECT id, when_text, location, spots, created_at
-            FROM games
-            ORDER BY id DESC
-            """
-        ).fetchall()
+        games = [
+            _as_dict(g)
+            for g in conn.execute(
+                """
+                SELECT id, when_text, location, spots, created_at
+                FROM games
+                """
+            ).fetchall()
+        ]
         if not games:
             return "none", {}
-        target = None
-        for game in games:
-            game = _as_dict(game)
-            if not game_is_upcoming(game):
-                continue
-            if int(game["spots"] or 0) > 0:
-                target = game
-                break
+        live = sort_games_chronologically(
+            [g for g in games if game_is_upcoming(g)]
+        )
+        if not live:
+            return "none", {}
+        target = next((g for g in live if int(g.get("spots") or 0) > 0), None)
         if target is None:
-            live = [ _as_dict(g) for g in games if game_is_upcoming(_as_dict(g)) ]
-            if not live:
-                return "none", {}
             return "full", live[0]
         prior = conn.execute(
             """
@@ -7027,6 +7025,20 @@ def game_is_upcoming(game: dict, *, now: Optional[datetime] = None) -> bool:
     if dt is None:
         return True
     return dt.date() >= now.date()
+
+
+def sort_games_chronologically(
+    games: list[dict], *, now: Optional[datetime] = None
+) -> list[dict]:
+    """Soonest first (date then time). Unparseable dates last; tie-break by id."""
+    now = now or datetime.now()
+    far = datetime.max.replace(tzinfo=None)
+
+    def sort_key(g: dict) -> tuple:
+        dt = game_when_datetime(g, now=now)
+        return (dt or far, int(g.get("id") or 0))
+
+    return sorted(games, key=sort_key)
 
 
 def format_game_card(when_text: str, spots: Any, location: str = "") -> str:
