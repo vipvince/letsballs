@@ -90,9 +90,11 @@ DEFAULT_GAME_SPOTS = 4
 GAMES_VISIBLE_MIN = 40
 INVITE_ELIGIBLE_MIN = 15  # can still get soft invites when a game turns cold/urgent
 INVITE_PASS_THRESHOLD = 70
-INVITE_URGENT_THRESHOLD = 48  # lower bar when ≤3 days away or poorly filled
+INVITE_URGENT_THRESHOLD = 48  # lower bar when cold/soon
+INVITE_COLD_THRESHOLD = 38  # even lower when <2 signups or ≤2 days
 INVITE_RAND_LOW = 0.8
 INVITE_RAND_HIGH = 1.2
+GAMES_CACHE_SECONDS = 120
 GITHUB_MEDIA_BASE = "https://raw.githubusercontent.com/vipvince/letsballs/main"
 WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LqLATzTW38oEUKIcXxXiDw?s=cl&p=i&mlu=4&ilr=4"
 CHARACTER_HERO_MAX_PX = 560
@@ -962,6 +964,15 @@ def _db_schema_ready() -> bool:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 delivered INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS game_reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id INTEGER NOT NULL,
+                ig_handle TEXT NOT NULL,
+                remind_date TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(game_id, ig_handle, remind_date)
+            );
             """,
         )
     seed_admin_user()
@@ -1275,18 +1286,19 @@ def verify_pin(ig_handle: str, pin: str) -> Optional[dict]:
 
 
 def list_games(limit: int = 40, include_past: bool = False) -> list[dict]:
-    # Short per-session cache — Streamlit reruns often hit this multiple times.
+    # Longer per-session cache — chat turns hit this often; writes invalidate.
     cache_key = f"_games_cache_{int(include_past)}_{limit}"
     cached = st.session_state.get(cache_key)
     cache_ts = float(st.session_state.get(f"{cache_key}_ts") or 0)
-    if cached is not None and (time.time() - cache_ts) < 20:
+    if cached is not None and (time.time() - cache_ts) < GAMES_CACHE_SECONDS:
         return list(cached)
 
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, when_text, location, spots, notes, created_by, created_at
-            FROM games
+            SELECT g.id, g.when_text, g.location, g.spots, g.notes, g.created_by, g.created_at,
+                   (SELECT COUNT(*) FROM game_signups s WHERE s.game_id = g.id) AS signup_count
+            FROM games g
             """
         ).fetchall()
     games = [_as_dict(r) for r in rows]
@@ -1797,8 +1809,7 @@ def remove_signup_reply(status: str, handle: str, game: dict) -> str:
 def maybe_game_invite(reply: str = "", user: Optional[dict] = None) -> str:
     """
     Soft invite via daily lock + urgency-weighted random.
-    Final = (user_score × urgency) × rand(0.8, 1.2); pass if >= threshold.
-    Low scores (< Games UI floor) only roll when the game is already urgent/cold.
+    Prefer cold games (<2 signups or ≤2 days) so fill rate recovers.
     """
     u = user or st.session_state.get("user")
     if not u or not user_can_be_invited(u):
@@ -1813,16 +1824,53 @@ def maybe_game_invite(reply: str = "", user: Optional[dict] = None) -> str:
     games = [g for g in list_games() if int(g.get("spots") or 0) > 0]
     if not games:
         return ""
-    game = games[0]
-    # Below board visibility: only try when the game needs people
+    cold = [g for g in games if game_is_cold(g)]
+    game = cold[0] if cold else games[0]
     if not user_sees_games(u) and not game_is_invite_urgent(game):
         return ""
     text = evaluate_game_invite(handle, game, user=u)
+    if text:
+        try:
+            st.session_state["pending_invite_game_id"] = int(game["id"])
+        except Exception:
+            pass
     return f"\n\n{text}" if text else ""
 
 
+def game_signup_count(game: dict) -> int:
+    try:
+        if game.get("signup_count") is not None:
+            return int(game.get("signup_count") or 0)
+    except (TypeError, ValueError):
+        pass
+    gid = game.get("id")
+    if gid is None:
+        return 0
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM game_signups WHERE game_id = ?",
+            (int(gid),),
+        ).fetchone()
+    d = _as_dict(row)
+    try:
+        return int(d.get("c") if d.get("c") is not None else d.get("COUNT(*)") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def game_is_cold(game: dict, *, now: Optional[datetime] = None) -> bool:
+    """Needs people: fewer than 2 signups, or starts within 2 days."""
+    now = now or datetime.now()
+    dt = game_when_datetime(game, now=now)
+    days = 999
+    if dt is not None:
+        days = max(0, (dt.date() - now.date()).days)
+    signed = game_signup_count(game)
+    return signed < 2 or days <= 2
+
+
 def game_urgency_multiplier(game: dict, *, now: Optional[datetime] = None) -> float:
-    """1.0 when popular/plenty of time; up to ~2.0 when soon or poorly filled."""
+    """1.0 when popular/plenty of time; up to ~2.2 when cold/soon."""
     now = now or datetime.now()
     dt = game_when_datetime(game, now=now)
     days = 999
@@ -1832,31 +1880,27 @@ def game_urgency_multiplier(game: dict, *, now: Optional[datetime] = None) -> fl
         spots = int(game.get("spots") or 0)
     except (TypeError, ValueError):
         spots = 0
+    signed = game_signup_count(game)
     mult = 1.0
     if days <= 1:
         mult = 2.0
-    elif days <= 3:
-        mult = 1.7
+    elif days <= 2:
+        mult = 1.85
     elif days <= 7:
         mult = 1.2
-    if spots >= 3:
-        mult = min(2.0, mult + 0.4)
+    if signed < 2:
+        mult = max(mult, 2.0)
+    elif spots >= 3:
+        mult = min(2.2, mult + 0.35)
     elif spots >= 2:
-        mult = min(2.0, mult + 0.2)
-    return round(mult, 2)
+        mult = min(2.2, mult + 0.2)
+    if game_is_cold(game, now=now):
+        mult = max(mult, 2.0)
+    return round(min(2.2, mult), 2)
 
 
 def game_is_invite_urgent(game: dict, *, now: Optional[datetime] = None) -> bool:
-    now = now or datetime.now()
-    dt = game_when_datetime(game, now=now)
-    days = 999
-    if dt is not None:
-        days = max(0, (dt.date() - now.date()).days)
-    try:
-        spots = int(game.get("spots") or 0)
-    except (TypeError, ValueError):
-        spots = 0
-    return days <= 3 or spots >= 2
+    return game_is_cold(game, now=now)
 
 
 def _today_str(*, now: Optional[datetime] = None) -> str:
@@ -1926,12 +1970,14 @@ def _save_invite_eval(
 def _natural_game_invite_copy(game: dict) -> str:
     when = format_game_when_text((game.get("when_text") or "").strip()) or "soon"
     loc = (game.get("location") or DEFAULT_GAME_LOCATION).strip()
+    gid = game.get("id")
+    label = f"#{gid} · {when}" if gid is not None else when
     return random.choice(
         [
-            f"對了，順便問下 — **{when}** 有場 tennis（{loc}）有位，你得閒 join 嗎？",
-            f"By the way — I’ve got a spot open for **{when}** @ {loc}. Want in?",
-            f"喔對了，**{when}** @ {loc} 仲有位，要不要 join？",
-            f"Quick one — **{when}** at {loc} still has space. Say yes and I’ll hold it.",
+            f"對了，順便問下 — **{label}** 有場 tennis（{loc}）有位，你得閒 join 嗎？",
+            f"By the way — spot open for **{label}** @ {loc}. Want in?",
+            f"喔對了，**{label}** @ {loc} 仲有位，要不要 join？",
+            f"Quick one — **{label}** at {loc} still has space. Say yes and I’ll hold it.",
         ]
     )
 
@@ -1946,6 +1992,7 @@ def evaluate_game_invite(
     """
     Run daily lock + weighted random for one game.
     Returns invite copy when INVITED, else "".
+    Cold games (<2 signups / ≤2 days) use a lower pass bar and force re-rolls.
     """
     now = now or datetime.now()
     handle = normalize_handle(ig_handle)
@@ -1954,11 +2001,10 @@ def evaluate_game_invite(
     u = user or get_user_by_handle(handle) or {}
     if not user_can_be_invited(u):
         return ""
-    urgent = game_is_invite_urgent(game, now=now)
-    # Low-score members: only when cold/soon — they don't see the board day-to-day
+    cold = game_is_cold(game, now=now)
+    urgent = cold  # alias
     if not user_sees_games(u) and not urgent:
         return ""
-    # Already signed up — don't nag
     with get_conn() as conn:
         prior_signup = conn.execute(
             """
@@ -1976,22 +2022,31 @@ def evaluate_game_invite(
     if existing:
         status = (existing.get("status") or "").upper()
         if status == "INVITED":
-            return ""  # already invited today
-        if status == "SKIPPED_LOCK" and not urgent:
             return ""
-        # Urgent: force re-eval with boosted urgency / lower bar
+        if status == "SKIPPED_LOCK" and not cold:
+            return ""
 
     score = invite_score_for_user(u)
     urgency = game_urgency_multiplier(game, now=now)
-    if existing and urgent:
-        urgency = min(2.0, max(urgency, 1.8))
+    if cold:
+        urgency = max(urgency, 2.0)
     luck = random.uniform(INVITE_RAND_LOW, INVITE_RAND_HIGH)
     weight = float(score) * float(urgency) * luck
-    threshold = float(INVITE_PASS_THRESHOLD)
-    if urgent or (existing and urgent) or not user_sees_games(u):
+    if cold:
+        threshold = float(INVITE_COLD_THRESHOLD)
+    elif urgent or not user_sees_games(u):
         threshold = float(INVITE_URGENT_THRESHOLD)
+    else:
+        threshold = float(INVITE_PASS_THRESHOLD)
 
     if weight >= threshold:
+        _save_invite_eval(
+            int(game["id"]), handle, eval_date, "INVITED", weight, score, urgency
+        )
+        return _natural_game_invite_copy(game)
+
+    # Cold + solid score: one more luck roll so fill rate recovers
+    if cold and score >= GAMES_VISIBLE_MIN and random.random() < 0.45:
         _save_invite_eval(
             int(game["id"]), handle, eval_date, "INVITED", weight, score, urgency
         )
@@ -2033,36 +2088,29 @@ def _confirms_game_join(text: str, last_assistant: str) -> bool:
     return bool(short_yes and asked)
 
 
-def join_next_game(ig_handle: str) -> tuple[str, dict]:
+def join_next_game(
+    ig_handle: str, preferred_game_id: Optional[int] = None
+) -> tuple[str, dict]:
     """
-    Hold one spot for a member who can see games.
+    Hold one spot. Prefer pending invite game when set.
     Returns ('ok'|'already'|'full'|'none', game).
     """
     handle = normalize_handle(ig_handle)
+    prefer = preferred_game_id
+    if prefer is None:
+        raw = st.session_state.get("pending_invite_game_id")
+        try:
+            prefer = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            prefer = None
     with get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS game_signups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                game_id INTEGER NOT NULL,
-                ig_handle TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                admin_seen INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(game_id, ig_handle)
-            )
-            """
-        )
-        signup_cols = _pragma_signup_cols(conn)
-        if "admin_seen" not in signup_cols:
-            conn.execute(
-                "ALTER TABLE game_signups ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"
-            )
         games = [
             _as_dict(g)
             for g in conn.execute(
                 """
-                SELECT id, when_text, location, spots, created_at
-                FROM games
+                SELECT g.id, g.when_text, g.location, g.spots, g.created_at,
+                       (SELECT COUNT(*) FROM game_signups s WHERE s.game_id = g.id) AS signup_count
+                FROM games g
                 """
             ).fetchall()
         ]
@@ -2073,7 +2121,18 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
         )
         if not live:
             return "none", {}
-        target = next((g for g in live if int(g.get("spots") or 0) > 0), None)
+        target = None
+        if prefer is not None:
+            target = next(
+                (
+                    g
+                    for g in live
+                    if int(g.get("id") or 0) == prefer and int(g.get("spots") or 0) > 0
+                ),
+                None,
+            )
+        if target is None:
+            target = next((g for g in live if int(g.get("spots") or 0) > 0), None)
         if target is None:
             return "full", live[0]
         prior = conn.execute(
@@ -2096,10 +2155,15 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             (target["id"], handle),
         )
         updated = conn.execute(
-            "SELECT id, when_text, location, spots FROM games WHERE id = ?",
+            """
+            SELECT g.id, g.when_text, g.location, g.spots,
+                   (SELECT COUNT(*) FROM game_signups s WHERE s.game_id = g.id) AS signup_count
+            FROM games g WHERE g.id = ?
+            """,
             (target["id"],),
         ).fetchone()
     _invalidate_games_cache()
+    st.session_state.pop("pending_invite_game_id", None)
     game_row = _as_dict(updated)
     try:
         notify_admins_of_join(handle, game_row)
@@ -2215,21 +2279,160 @@ def consume_member_dms(ig_handle: str) -> str:
     return "\n\n".join(lines)
 
 
+def consume_day_before_reminders(ig_handle: str) -> str:
+    """In-app reminder the day before a signed-up game."""
+    handle = normalize_handle(ig_handle)
+    if not handle:
+        return ""
+    now = datetime.now()
+    tomorrow = (now + timedelta(days=1)).date()
+    remind_key = tomorrow.isoformat()
+    lines: list[str] = []
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT g.id, g.when_text, g.location, g.created_at
+            FROM games g
+            JOIN game_signups s ON s.game_id = g.id
+            WHERE lower(s.ig_handle) = ?
+            """,
+            (handle,),
+        ).fetchall()
+        for r in rows:
+            game = _as_dict(r)
+            dt = game_when_datetime(game, now=now)
+            if dt is None or dt.date() != tomorrow:
+                continue
+            prior = conn.execute(
+                """
+                SELECT id FROM game_reminders
+                WHERE game_id = ? AND lower(ig_handle) = ? AND remind_date = ?
+                """,
+                (int(game["id"]), handle, remind_key),
+            ).fetchone()
+            if prior:
+                continue
+            when = format_game_when_text(game.get("when_text") or "") or "tomorrow"
+            loc = game.get("location") or DEFAULT_GAME_LOCATION
+            lines.append(
+                f"Reminder — you’re down for **#{game['id']} · {when}** @ {loc} tomorrow. "
+                f"See you on court 🎾"
+            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO game_reminders (game_id, ig_handle, remind_date)
+                    VALUES (?, ?, ?)
+                    """,
+                    (int(game["id"]), handle, remind_key),
+                )
+            except Exception:
+                pass
+    if not lines:
+        return ""
+    return "**Heads up**\n\n" + "\n\n".join(lines)
+
+
+def member_inbox_bits(ig_handle: str) -> str:
+    """DMs + day-before reminders for a member."""
+    parts = []
+    dms = consume_member_dms(ig_handle)
+    if dms:
+        parts.append(dms)
+    rem = consume_day_before_reminders(ig_handle)
+    if rem:
+        parts.append(rem)
+    return "\n\n".join(parts)
+
+
+def persona_line(user: dict) -> tuple[str, Optional[str]]:
+    """Return (welcome text, photo_path) for character stickiness."""
+    animal = user.get("mascot") or user.get("animal") or "player"
+    emoji = user.get("animal_emoji") or "🎾"
+    photo = animal_photo_path(animal, user.get("avatar_path"))
+    photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
+    line = random.choice(
+        [
+            f"Back on court, **{animal}** {emoji}",
+            f"**{animal}** {emoji} is ready — let’s play.",
+            f"Your court persona **{animal}** {emoji} is locked in.",
+            f"Welcome back, **{animal}** {emoji}",
+        ]
+    )
+    return line, photo_path
+
+
+def admin_today_markdown() -> str:
+    """Compact admin ops board for chat."""
+    games = list_games()
+    today = _today_str()
+    blocks = ["**Today**"]
+    if not games:
+        blocks.append("_No upcoming games._")
+    else:
+        for g in games:
+            when = format_game_when_text(g.get("when_text") or "") or "TBD"
+            loc = g.get("location") or DEFAULT_GAME_LOCATION
+            try:
+                spots = int(g.get("spots") or 0)
+            except (TypeError, ValueError):
+                spots = g.get("spots")
+            signed = game_signup_count(g)
+            cold = " · **COLD**" if game_is_cold(g) and int(spots or 0) > 0 else ""
+            blocks.append(
+                f"- **#{g['id']}** · {when} @ {loc} — "
+                f"{signed} in · {spots} open{cold}"
+            )
+    with get_conn() as conn:
+        inv = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM game_invite_evals
+            WHERE eval_date = ? AND status = 'INVITED'
+            """,
+            (today,),
+        ).fetchone()
+        skip = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM game_invite_evals
+            WHERE eval_date = ? AND status = 'SKIPPED_LOCK'
+            """,
+            (today,),
+        ).fetchone()
+    inv_n = int(_as_dict(inv).get("c") or 0)
+    skip_n = int(_as_dict(skip).get("c") or 0)
+    pending = pending_admin_signup_notices()
+    blocks.append(
+        f"\n**Invites today** — {inv_n} sent · {skip_n} skipped"
+    )
+    if pending:
+        blocks.append(f"**Unread joins** — {len(pending)}")
+        for r in pending[:8]:
+            blocks.append(
+                f"- @{r.get('ig_handle')} → #{r.get('game_id')}"
+            )
+    else:
+        blocks.append("**Unread joins** — none")
+    blocks.append("\n_Shortcuts: `games` · `signups` · `msg @handle …` · `as @handle`_")
+    return "\n".join(blocks)
+
+
 def game_join_reply(status: str, game: dict) -> str:
     when = format_game_when_text((game or {}).get("when_text") or "") or "the next session"
     loc = (game or {}).get("location") or DEFAULT_GAME_LOCATION
+    gid = (game or {}).get("id")
+    label = f"#{gid} · {when}" if gid is not None else when
     wa = f"[Join the WhatsApp group]({WHATSAPP_GROUP_URL})"
     if status == "none":
         return "There is no game on the board right now."
     if status == "full":
-        return f"**{when}** @ {loc} is full."
+        return f"**{label}** @ {loc} is full."
     if status == "already":
         return (
-            f"You’re already in for **{when}** @ {loc}.\n\n"
+            f"You’re already in for **{label}** @ {loc}.\n\n"
             f"For logistics (court, timing, who’s coming), {wa}."
         )
     return (
-        f"You’re in for **{when}** @ {loc}.\n\n"
+        f"You’re in for **{label}** @ {loc}.\n\n"
         f"Tap in for logistics — court updates and who’s coming:\n{wa}"
     )
 
@@ -2479,7 +2682,7 @@ def admin_help_text() -> str:
         f"(format **Sept 26 (Saturday) @ 5pm**, default **{DEFAULT_GAME_LOCATION}**)\n"
         "- `full game #3` / `spots #3 2` — fill headcount or set open spots\n"
         "- `delete game #3` — remove game + signups\n"
-        "- `games` / `signups` — board & who’s in\n"
+        "- `games` / `signups` / `today` — board, who’s in, mini dashboard\n"
         "- `remove @handle` or `remove @handle from #3` — free a spot\n\n"
         "**Members**\n"
         "- `user @handle` — profile + invite score (admin only)\n"
@@ -2507,6 +2710,9 @@ def try_admin_command(text: str) -> bool:
         return True
     if lower in {"animals", "/animals", "list animals", "avatars", "photos"}:
         append_assistant(animals_as_context())
+        return True
+    if lower in {"today", "dash", "dashboard", "/today", "ops"}:
+        append_assistant(admin_today_markdown())
         return True
     # Impersonation exit — also reachable while testing a member (see handle_logged_in)
     if lower in {"back", "unimpersonate", "as me", "stop as", "stop impersonating"}:
@@ -8115,14 +8321,15 @@ def _apply_restored_user(user: dict) -> None:
         if "Drop your Instagram handle" in content:
             st.session_state.messages = []
     if not st.session_state.messages:
-        animal = user.get("mascot") or user.get("animal") or "player"
-        emoji = user.get("animal_emoji") or "🎾"
-        photo = animal_photo_path(animal, user.get("avatar_path"))
-        photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
-        append_assistant(
-            f"Welcome back, **{animal}** {emoji}",
-            image=photo_path,
-        )
+        line, photo_path = persona_line(user)
+        inbox = member_inbox_bits(user.get("ig_handle") or "") if not is_admin(user) else ""
+        invite = maybe_game_invite(user=user) if user_can_be_invited(user) else ""
+        body = line
+        if invite:
+            body += invite
+        if inbox:
+            body += f"\n\n{inbox}"
+        append_assistant(body, image=photo_path)
 
 
 def try_restore_login(cookie_map: Optional[dict] = None) -> bool:
@@ -8975,16 +9182,23 @@ def run_quick_action(action: str) -> None:
     key = (action or "").strip().lower()
     avatar = user_avatar(user)
     if key == "join":
-        open_g = next((g for g in list_games() if int(g.get("spots") or 0) > 0), None)
+        open_games = [g for g in list_games() if int(g.get("spots") or 0) > 0]
+        cold = [g for g in open_games if game_is_cold(g)]
+        open_g = cold[0] if cold else (open_games[0] if open_games else None)
         when_bit = short_game_when((open_g or {}).get("when_text") or "")
-        append_user(f"Join {when_bit}", avatar=avatar)
+        gid = (open_g or {}).get("id")
+        join_label = f"Join #{gid} {when_bit}" if gid is not None else f"Join {when_bit}"
+        append_user(join_label, avatar=avatar)
         if not user_sees_games(user):
             append_assistant(
                 "No open spots for you on the board right now — "
                 "ask about tennis gear, weather, or courts anytime."
             )
             return
-        status, game = join_next_game(user.get("ig_handle") or "")
+        prefer = int(gid) if gid is not None else None
+        if prefer is not None:
+            st.session_state["pending_invite_game_id"] = prefer
+        status, game = join_next_game(user.get("ig_handle") or "", preferred_game_id=prefer)
         append_assistant(game_join_reply(status, game))
         return
     if key == "board":
@@ -9018,8 +9232,14 @@ def render_quick_actions() -> Optional[str]:
     labels: list[tuple[str, str]] = []
     # Only offer Join / Games when score allows and something is scheduled
     if can_join:
-        when_bit = short_game_when(open_games[0].get("when_text") or "")
-        labels.append(("join", f"🎾 Join {when_bit}"))
+        target = open_games[0]
+        cold = [g for g in open_games if game_is_cold(g)]
+        if cold:
+            target = cold[0]
+        when_bit = short_game_when(target.get("when_text") or "")
+        gid = target.get("id")
+        label = f"🎾 Join #{gid} {when_bit}" if gid is not None else f"🎾 Join {when_bit}"
+        labels.append(("join", label))
     if upcoming:
         labels.append(("board", "🎾 Games"))
     labels.append(("help" if is_admin(user) else "tips", "✨ Help" if is_admin(user) else "✨ Tips"))
@@ -9498,16 +9718,16 @@ def handle_need_pin_signup(text: str) -> None:
     st.session_state.user = user
     st.session_state.auth_state = LOGGED_IN
     persist_login(user)
-    animal = user.get("mascot") or user.get("animal") or "player"
-    emoji = user.get("animal_emoji") or "🎾"
+    line, photo_path = persona_line(user)
     invite = maybe_game_invite(user=user) if user_can_be_invited(user) else ""
     notices = consume_admin_signup_notices() if is_admin(user) else ""
     notice_bit = f"\n\n{notices}" if notices else ""
-    dms = "" if is_admin(user) else consume_member_dms(user.get("ig_handle") or "")
-    if dms:
-        notice_bit = f"\n\n{dms}" + notice_bit
+    inbox = "" if is_admin(user) else member_inbox_bits(user.get("ig_handle") or "")
+    if inbox:
+        notice_bit = f"\n\n{inbox}" + notice_bit
+        st.session_state["_dms_flushed"] = True
     append_assistant(
-        f"You’re in, **{animal}** {emoji}\n\n"
+        f"{line}\n\n"
         "Ask about games, spots, or courts. "
         + (
             "Type `help` for admin commands."
@@ -9515,7 +9735,8 @@ def handle_need_pin_signup(text: str) -> None:
             else ""
         )
         + invite
-        + notice_bit
+        + notice_bit,
+        image=photo_path,
     )
 
 
@@ -9547,21 +9768,23 @@ def handle_need_pin_login(text: str) -> None:
     st.session_state.user = user
     st.session_state.auth_state = LOGGED_IN
     persist_login(user)
-    animal = user.get("mascot") or user.get("animal") or "player"
-    emoji = user.get("animal_emoji") or "🎾"
+    line, photo_path = persona_line(user)
     invite = maybe_game_invite(user=user) if user_can_be_invited(user) else ""
     opener = (
         "What do you want to know about upcoming games?"
         if user_sees_games(user)
         else "Ask me anything tennis — racquets, weather, courts, vibes."
     )
-    dms = consume_member_dms(user.get("ig_handle") or "")
-    dm_bit = f"\n\n{dms}" if dms else ""
+    inbox = member_inbox_bits(user.get("ig_handle") or "")
+    dm_bit = f"\n\n{inbox}" if inbox else ""
+    if inbox:
+        st.session_state["_dms_flushed"] = True
     append_assistant(
-        f"Back on court, **{animal}** {emoji}\n\n"
+        f"{line}\n\n"
         + opener
         + invite
-        + dm_bit
+        + dm_bit,
+        image=photo_path,
     )
 
 
@@ -9575,16 +9798,13 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     fresh = get_user_by_handle(user.get("ig_handle") or "") or user
     st.session_state.user = fresh
     persist_login(fresh)
-    animal = fresh.get("mascot") or fresh.get("animal") or "player"
-    emoji = fresh.get("animal_emoji") or "🎾"
+    line, photo_path = persona_line(fresh)
     invite = maybe_game_invite(user=fresh) if user_can_be_invited(fresh) else ""
     notices = consume_admin_signup_notices() if is_admin(fresh) else ""
     notice_bit = f"\n\n{notices}" if notices else ""
     notice_bit += persistence_warning_for_admin() if is_admin(fresh) else ""
-    photo = animal_photo_path(animal, fresh.get("avatar_path"))
-    photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
     append_assistant(
-        f"{welcome}, **{animal}** {emoji}\n\n"
+        f"{line}\n\n"
         "Type `help` for admin commands."
         + invite
         + notice_bit,
@@ -9609,13 +9829,12 @@ def handle_logged_in(text: str) -> None:
         append_assistant(f"Back as **{at}**. Type `help` for admin commands.")
         return
 
-    # Deliver queued admin notes once per session turn (members only)
+    # Deliver queued admin notes / day-before reminders once
     if user and not is_admin(user) and not st.session_state.get("_dms_flushed"):
-        dms = consume_member_dms(user.get("ig_handle") or "")
-        if dms:
+        inbox = member_inbox_bits(user.get("ig_handle") or "")
+        if inbox:
             st.session_state["_dms_flushed"] = True
-            append_assistant(dms)
-            # continue into normal handling of their message
+            append_assistant(inbox)
 
     if lower in {"logout", "log out", "restart"}:
         st.session_state.pop("admin_real_user", None)
@@ -9629,7 +9848,9 @@ def handle_logged_in(text: str) -> None:
         append_assistant("Logged out. Drop an IG handle when you’re ready.")
         return
 
-    # One-tap / typed shortcuts for everyone logged in
+    if lower in {"today", "dash", "dashboard", "/today", "ops"} and is_admin(user):
+        append_assistant(admin_today_markdown())
+        return
     if lower in {"board", "games", "/games", "list games", "upcoming", "upcoming games"}:
         if not user_sees_games(user) and not is_admin(user):
             append_assistant("Nothing on your game board right now — tennis chat is still open.")
