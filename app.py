@@ -86,6 +86,11 @@ PIN_SALT = "letsballs-pin-v1"
 ADMIN_HANDLES = {"admin", "letsballs", "letsballs_admin", "vip", "ht___here"}
 DEFAULT_GAME_LOCATION = "Happy Valley"
 DEFAULT_GAME_SPOTS = 4
+# Silent invite targeting (never shown to members)
+GAMES_VISIBLE_MIN = 40
+INVITE_PASS_THRESHOLD = 70
+INVITE_RAND_LOW = 0.8
+INVITE_RAND_HIGH = 1.2
 GITHUB_MEDIA_BASE = "https://raw.githubusercontent.com/vipvince/letsballs/main"
 WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LqLATzTW38oEUKIcXxXiDw?s=cl&p=i&mlu=4&ilr=4"
 CHARACTER_HERO_MAX_PX = 560
@@ -922,11 +927,32 @@ def _db_schema_ready() -> bool:
             conn.execute("ALTER TABLE users ADD COLUMN gate_detail TEXT")
         if "assign_why" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN assign_why TEXT")
+        if "invite_score" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN invite_score INTEGER")
+        if "invite_score_override" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN invite_score_override INTEGER")
         signup_cols = _col_names(conn.execute("PRAGMA table_info(game_signups)").fetchall())
         if signup_cols and "admin_seen" not in signup_cols:
             conn.execute(
                 "ALTER TABLE game_signups ADD COLUMN admin_seen INTEGER NOT NULL DEFAULT 0"
             )
+        _run_script(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS game_invite_evals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id INTEGER NOT NULL,
+                ig_handle TEXT NOT NULL,
+                eval_date TEXT NOT NULL,
+                status TEXT NOT NULL,
+                final_weight REAL,
+                user_score INTEGER,
+                urgency REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(game_id, ig_handle, eval_date)
+            );
+            """,
+        )
     seed_admin_user()
     return True
 
@@ -946,6 +972,10 @@ def _ensure_creator_signups() -> bool:
         pass
     try:
         normalize_stored_game_whens()
+    except Exception:
+        pass
+    try:
+        backfill_invite_scores()
     except Exception:
         pass
     return True
@@ -1013,20 +1043,41 @@ def seed_admin_user() -> None:
                 """
                 UPDATE users
                 SET pin_hash = ?, animal = ?, vibe = ?, animal_emoji = ?,
-                    mascot = ?, avatar_path = ?, ai_enabled = 1
+                    mascot = ?, avatar_path = ?, ai_enabled = 1,
+                    invite_score = 100, invite_score_override = 100,
+                    gate_detail = ?
                 WHERE id = ?
                 """,
-                (pin_h, animal, vibe, emoji, animal, avatar_path, row["id"]),
+                (
+                    pin_h,
+                    animal,
+                    vibe,
+                    emoji,
+                    animal,
+                    avatar_path,
+                    "Admin account. Invite score does not apply (treated as 100).",
+                    row["id"],
+                ),
             )
         else:
             conn.execute(
                 """
                 INSERT INTO users (
-                    ig_handle, pin_hash, animal, vibe, animal_emoji, mascot, avatar_path, ai_enabled
+                    ig_handle, pin_hash, animal, vibe, animal_emoji, mascot,
+                    avatar_path, ai_enabled, invite_score, invite_score_override, gate_detail
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 100, 100, ?)
                 """,
-                (handle, pin_h, animal, vibe, emoji, animal, avatar_path),
+                (
+                    handle,
+                    pin_h,
+                    animal,
+                    vibe,
+                    emoji,
+                    animal,
+                    avatar_path,
+                    "Admin account. Invite score does not apply (treated as 100).",
+                ),
             )
 
 
@@ -1115,10 +1166,18 @@ def upsert_pending_user(
     ai_enabled: int = 1,
     gate_detail: str = "",
     assign_why: str = "",
+    invite_score: Optional[int] = None,
 ) -> None:
     """Save identity before PIN is set (pin_hash stays NULL until signup finishes)."""
     handle = normalize_handle(ig_handle)
     mascot = mascot or animal
+    if invite_score is None:
+        score, detail = compute_invite_score(
+            {"gender": gender or "", "age_guess": age_guess or ""}
+        )
+        invite_score = score
+        if not gate_detail:
+            gate_detail = detail
     with get_conn() as conn:
         existing = conn.execute(
             "SELECT id, pin_hash, ig_photo_path FROM users WHERE lower(ig_handle) = ?",
@@ -1133,8 +1192,8 @@ def upsert_pending_user(
                 UPDATE users
                 SET animal = ?, vibe = ?, animal_emoji = ?, mascot = ?,
                     avatar_path = ?, ig_photo_path = ?,
-                    gender = ?, nationality = ?, age_guess = ?, ai_enabled = ?,
-                    gate_detail = ?, assign_why = ?
+                    gender = ?, nationality = ?, age_guess = ?, ai_enabled = 1,
+                    gate_detail = ?, assign_why = ?, invite_score = ?
                 WHERE id = ?
                 """,
                 (
@@ -1147,9 +1206,9 @@ def upsert_pending_user(
                     gender or None,
                     nationality or None,
                     age_guess or None,
-                    1 if ai_enabled else 0,
                     gate_detail or None,
                     assign_why or None,
+                    int(invite_score),
                     existing["id"],
                 ),
             )
@@ -1159,9 +1218,9 @@ def upsert_pending_user(
                 INSERT INTO users (
                     ig_handle, pin_hash, animal, vibe, animal_emoji, mascot,
                     avatar_path, ig_photo_path, gender, nationality, age_guess,
-                    ai_enabled, gate_detail, assign_why
+                    ai_enabled, gate_detail, assign_why, invite_score
                 )
-                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     handle,
@@ -1174,9 +1233,9 @@ def upsert_pending_user(
                     gender or None,
                     nationality or None,
                     age_guess or None,
-                    1 if ai_enabled else 0,
                     gate_detail or None,
                     assign_why or None,
+                    int(invite_score),
                 ),
             )
 
@@ -1378,7 +1437,7 @@ def delete_game(game_id: int) -> tuple[bool, dict]:
 
 def admin_add_user(ig_handle: str, pin: str) -> tuple[str, dict]:
     """
-    Create or update a member with a PIN, gated in.
+    Create or update a member with a PIN (invite score 90).
     Returns ('created'|'updated'|'bad', user).
     """
     handle = normalize_handle(ig_handle)
@@ -1391,12 +1450,17 @@ def admin_add_user(ig_handle: str, pin: str) -> tuple[str, dict]:
     emoji = "🐱"
     vibe = "Added by admin."
     avatar_path = "crosscourt_cat.png"
+    detail = (
+        "Invite score **90**/100 (admin override).\n"
+        "- Automatic gender/age check is ignored while override is set."
+    )
     with get_conn() as conn:
         if existing:
             conn.execute(
                 """
                 UPDATE users
-                SET pin_hash = ?, ai_enabled = 1, gate_override = 1,
+                SET pin_hash = ?, ai_enabled = 1, gate_override = NULL,
+                    invite_score = 90, invite_score_override = 90, gate_detail = ?,
                     animal = COALESCE(NULLIF(animal, ''), ?),
                     mascot = COALESCE(NULLIF(mascot, ''), ?),
                     animal_emoji = COALESCE(NULLIF(animal_emoji, ''), ?),
@@ -1406,6 +1470,7 @@ def admin_add_user(ig_handle: str, pin: str) -> tuple[str, dict]:
                 """,
                 (
                     hash_pin(pin),
+                    detail,
                     animal,
                     animal,
                     emoji,
@@ -1419,9 +1484,10 @@ def admin_add_user(ig_handle: str, pin: str) -> tuple[str, dict]:
             """
             INSERT INTO users (
                 ig_handle, pin_hash, animal, vibe, animal_emoji, mascot,
-                avatar_path, ai_enabled, gate_override, gate_detail, assign_why
+                avatar_path, ai_enabled, invite_score, invite_score_override,
+                gate_detail, assign_why
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 90, 90, ?, ?)
             """,
             (
                 handle,
@@ -1431,7 +1497,7 @@ def admin_add_user(ig_handle: str, pin: str) -> tuple[str, dict]:
                 emoji,
                 animal,
                 avatar_path,
-                "Admin created this account and forced gate in.",
+                detail,
                 "Admin created account.",
             ),
         )
@@ -1564,8 +1630,8 @@ def games_board_markdown() -> str:
 def member_tips_text() -> str:
     return (
         "**Quick tips**\n\n"
-        "- **Games** — see upcoming sessions (when an admin has posted them)\n"
-        "- **Join** — grab the next open spot (only shows when a game has spots)\n"
+        "- **Games** — see upcoming sessions when they appear for you\n"
+        "- **Join** — grab the next open spot when a Join button shows\n"
         "- Ask about racquets, weather, courts — tennis talk is welcome\n"
         "- Type `logout` to switch accounts"
     )
@@ -1714,23 +1780,206 @@ def remove_signup_reply(status: str, handle: str, game: dict) -> str:
     )
 
 
-def maybe_game_invite(reply: str = "") -> str:
-    """Sometimes append a soft invite to an upcoming game for eligible members."""
+def maybe_game_invite(reply: str = "", user: Optional[dict] = None) -> str:
+    """
+    Soft invite via daily lock + urgency-weighted random.
+    Final = (user_score × urgency) × rand(0.8, 1.2); pass if >= INVITE_PASS_THRESHOLD.
+    """
+    u = user or st.session_state.get("user")
+    if not u or not user_sees_games(u):
+        return ""
+    handle = normalize_handle(u.get("ig_handle") or "")
+    if not handle:
+        return ""
+    lower = (reply or "").lower()
+    if any(w in lower for w in ("join", "spot", "sign up", "come play", "want in", "upcoming", "得閒", "有位")):
+        return ""
+
     games = [g for g in list_games() if int(g.get("spots") or 0) > 0]
     if not games:
         return ""
-    lower = (reply or "").lower()
-    if any(w in lower for w in ("join", "spot", "sign up", "come play", "want in", "upcoming")):
-        return ""
-    if random.random() > 0.38:
-        return ""
-    g = games[0]
-    loc = g.get("location") or DEFAULT_GAME_LOCATION
-    card = format_game_card(g.get("when_text") or "", g.get("spots"), loc)
-    return (
-        f"\n\nWant in on **{card}**? "
-        "Say yes and I’ll hold one."
+    game = games[0]
+    text = evaluate_game_invite(handle, game, user=u)
+    return f"\n\n{text}" if text else ""
+
+
+def game_urgency_multiplier(game: dict, *, now: Optional[datetime] = None) -> float:
+    """1.0 when popular/plenty of time; up to ~2.0 when soon or poorly filled."""
+    now = now or datetime.now()
+    dt = game_when_datetime(game, now=now)
+    days = 999
+    if dt is not None:
+        days = max(0, (dt.date() - now.date()).days)
+    try:
+        spots = int(game.get("spots") or 0)
+    except (TypeError, ValueError):
+        spots = 0
+    mult = 1.0
+    if days <= 1:
+        mult = 2.0
+    elif days <= 3:
+        mult = 1.7
+    elif days <= 7:
+        mult = 1.2
+    if spots >= 3:
+        mult = min(2.0, mult + 0.4)
+    elif spots >= 2:
+        mult = min(2.0, mult + 0.2)
+    return round(mult, 2)
+
+
+def game_is_invite_urgent(game: dict, *, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now()
+    dt = game_when_datetime(game, now=now)
+    days = 999
+    if dt is not None:
+        days = max(0, (dt.date() - now.date()).days)
+    try:
+        spots = int(game.get("spots") or 0)
+    except (TypeError, ValueError):
+        spots = 0
+    return days <= 3 or spots >= 2
+
+
+def _today_str(*, now: Optional[datetime] = None) -> str:
+    return (now or datetime.now()).strftime("%Y-%m-%d")
+
+
+def _get_invite_eval_today(game_id: int, ig_handle: str, eval_date: str) -> Optional[dict]:
+    handle = normalize_handle(ig_handle)
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, game_id, ig_handle, eval_date, status, final_weight, user_score, urgency
+            FROM game_invite_evals
+            WHERE game_id = ? AND lower(ig_handle) = ? AND eval_date = ?
+            """,
+            (int(game_id), handle, eval_date),
+        ).fetchone()
+    return _as_dict(row) if row else None
+
+
+def _save_invite_eval(
+    game_id: int,
+    ig_handle: str,
+    eval_date: str,
+    status: str,
+    final_weight: float,
+    user_score: int,
+    urgency: float,
+) -> None:
+    handle = normalize_handle(ig_handle)
+    with get_conn() as conn:
+        prior = conn.execute(
+            """
+            SELECT id FROM game_invite_evals
+            WHERE game_id = ? AND lower(ig_handle) = ? AND eval_date = ?
+            """,
+            (int(game_id), handle, eval_date),
+        ).fetchone()
+        if prior:
+            conn.execute(
+                """
+                UPDATE game_invite_evals
+                SET status = ?, final_weight = ?, user_score = ?, urgency = ?
+                WHERE id = ?
+                """,
+                (status, float(final_weight), int(user_score), float(urgency), int(_as_dict(prior)["id"])),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO game_invite_evals
+                    (game_id, ig_handle, eval_date, status, final_weight, user_score, urgency)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(game_id),
+                    handle,
+                    eval_date,
+                    status,
+                    float(final_weight),
+                    int(user_score),
+                    float(urgency),
+                ),
+            )
+
+
+def _natural_game_invite_copy(game: dict) -> str:
+    when = format_game_when_text((game.get("when_text") or "").strip()) or "soon"
+    loc = (game.get("location") or DEFAULT_GAME_LOCATION).strip()
+    return random.choice(
+        [
+            f"對了，順便問下 — **{when}** 有場 tennis（{loc}）有位，你得閒 join 嗎？",
+            f"By the way — I’ve got a spot open for **{when}** @ {loc}. Want in?",
+            f"喔對了，**{when}** @ {loc} 仲有位，要不要 join？",
+            f"Quick one — **{when}** at {loc} still has space. Say yes and I’ll hold it.",
+        ]
     )
+
+
+def evaluate_game_invite(
+    ig_handle: str,
+    game: dict,
+    *,
+    user: Optional[dict] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """
+    Run daily lock + weighted random for one game.
+    Returns invite copy when INVITED, else "".
+    """
+    now = now or datetime.now()
+    handle = normalize_handle(ig_handle)
+    if not handle or not game:
+        return ""
+    u = user or get_user_by_handle(handle) or {}
+    if not user_sees_games(u):
+        return ""
+    # Already signed up — don't nag
+    with get_conn() as conn:
+        prior_signup = conn.execute(
+            """
+            SELECT id FROM game_signups
+            WHERE game_id = ? AND lower(ig_handle) = ?
+            """,
+            (int(game["id"]), handle),
+        ).fetchone()
+    if prior_signup:
+        return ""
+
+    eval_date = _today_str(now=now)
+    existing = _get_invite_eval_today(int(game["id"]), handle, eval_date)
+    urgent = game_is_invite_urgent(game, now=now)
+
+    if existing:
+        status = (existing.get("status") or "").upper()
+        if status == "INVITED":
+            return ""  # already invited today
+        if status == "SKIPPED_LOCK" and not urgent:
+            return ""
+        # Urgent: force re-eval with boosted urgency / slightly lower bar
+
+    score = invite_score_for_user(u)
+    urgency = game_urgency_multiplier(game, now=now)
+    if existing and urgent:
+        urgency = min(2.0, max(urgency, 1.8))
+    luck = random.uniform(INVITE_RAND_LOW, INVITE_RAND_HIGH)
+    weight = float(score) * float(urgency) * luck
+    threshold = INVITE_PASS_THRESHOLD
+    if existing and urgent:
+        threshold = INVITE_PASS_THRESHOLD * 0.85
+
+    if weight >= threshold:
+        _save_invite_eval(
+            int(game["id"]), handle, eval_date, "INVITED", weight, score, urgency
+        )
+        return _natural_game_invite_copy(game)
+
+    _save_invite_eval(
+        int(game["id"]), handle, eval_date, "SKIPPED_LOCK", weight, score, urgency
+    )
+    return ""
 
 
 def _last_assistant_text() -> str:
@@ -1747,20 +1996,25 @@ def _confirms_game_join(text: str, last_assistant: str) -> bool:
     if not raw or len(raw) > 180:
         return False
     explicit = re.search(
-        r"\b(join|joining|sign me up|count me in|i'?m in|im in|hold (a |one |my )?spot|want in|book me)\b",
+        r"\b(join|joining|sign me up|count me in|i'?m in|im in|hold (a |one |my )?spot|want in|book me)\b"
+        r"|得閒|要join|要 join|我要|算我|報名",
         raw,
         re.I,
     )
     if explicit:
         return True
-    short_yes = re.fullmatch(r"(yes|yeah|yep|yup|ok|okay|sure|in)[.!\s]*", raw, re.I)
-    asked = re.search(r"want in|spots left|say yes|hold one", last_assistant or "", re.I)
+    short_yes = re.fullmatch(r"(yes|yeah|yep|yup|ok|okay|sure|in|好|要|得)[.!\s]*", raw, re.I)
+    asked = re.search(
+        r"want in|spots left|say yes|hold one|得閒|有位|want in\?|join 嗎",
+        last_assistant or "",
+        re.I,
+    )
     return bool(short_yes and asked)
 
 
 def join_next_game(ig_handle: str) -> tuple[str, dict]:
     """
-    Hold one spot for a gated-in member.
+    Hold one spot for a member who can see games.
     Returns ('ok'|'already'|'full'|'none', game).
     """
     handle = normalize_handle(ig_handle)
@@ -1867,93 +2121,12 @@ def apply_admin_gate(ig_handle: str, eligible: bool) -> bool:
 
 
 def set_user_gate(ig_handle: str, enabled: bool, animal_query: str = "") -> Optional[dict]:
-    """Force a handle in or out of club chat. Creates a row if they have not signed up yet."""
-    handle = normalize_handle(ig_handle)
-    if not handle or not re.match(r"^[A-Za-z0-9._]{2,30}$", handle):
-        return None
-    flag = 1 if enabled else 0
-    avatar = resolve_pool_avatar(animal_query) if enabled and animal_query else None
-    with get_conn() as conn:
-        existing = conn.execute(
-            "SELECT id, animal, mascot, avatar_path FROM users WHERE lower(ig_handle) = ?",
-            (handle,),
-        ).fetchone()
-        existing = _as_dict(existing) if existing else {}
-        if existing.get("id") is not None:
-            conn.execute(
-                """
-                UPDATE users SET ai_enabled = ?, gate_override = ?, gate_detail = ? WHERE id = ?
-                """,
-                (
-                    flag,
-                    flag,
-                    "Admin forced in. The automatic check is ignored."
-                    if enabled
-                    else "Admin forced out. The automatic check is ignored. The 25% roll does not apply.",
-                    existing["id"],
-                ),
-            )
-            if not enabled:
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET animal = ?, mascot = ?, animal_emoji = ?, avatar_path = ?,
-                        assign_why = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        GATE_OUT_LABEL,
-                        GATE_OUT_LABEL,
-                        GATE_OUT_EMOJI,
-                        GATE_OUT_FILE,
-                        "Admin gated out — assigned forehand frog.",
-                        existing["id"],
-                    ),
-                )
-            elif avatar:
-                conn.execute(
-                    """
-                    UPDATE users
-                    SET animal = ?, mascot = ?, animal_emoji = ?, avatar_path = ?,
-                        assign_why = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        avatar["label"],
-                        avatar["label"],
-                        avatar.get("emoji") or "🎾",
-                        avatar["file"],
-                        f"Admin gated in and assigned {avatar['label']}.",
-                        existing["id"],
-                    ),
-                )
-        else:
-            animal = avatar["label"] if avatar else ("tennis cat" if enabled else GATE_OUT_LABEL)
-            emoji = (avatar.get("emoji") if avatar else ("🐱" if enabled else GATE_OUT_EMOJI))
-            file_name = avatar["file"] if avatar else ("crosscourt_cat.png" if enabled else GATE_OUT_FILE)
-            conn.execute(
-                """
-                INSERT INTO users (
-                    ig_handle, pin_hash, ai_enabled, gate_override, gate_detail,
-                    animal, mascot, animal_emoji, avatar_path, assign_why
-                )
-                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    handle,
-                    flag,
-                    flag,
-                    "Admin forced in. The automatic check is ignored."
-                    if enabled
-                    else "Admin forced out. The automatic check is ignored. The 25% roll does not apply.",
-                    animal,
-                    animal,
-                    emoji,
-                    file_name,
-                    f"Admin created row and assigned {animal}.",
-                ),
-            )
-    return get_user_by_handle(handle)
+    """Legacy alias: gate in → score 90, gate out → score 25."""
+    return set_user_invite_score(
+        ig_handle,
+        90 if enabled else 25,
+        animal_query=animal_query if enabled else "",
+    )
 
 
 def resolve_pool_avatar(query: str) -> Optional[dict[str, Any]]:
@@ -2011,7 +2184,7 @@ def admin_assign_animal(ig_handle: str, query: str) -> tuple[str, dict]:
 
 def animals_as_context() -> str:
     seen: set[str] = set()
-    lines = ["**Animal photos** (use `assign @handle travel camel` or `gate in @handle as frog`)"]
+    lines = ["**Animal photos** (use `assign @handle travel camel` or `score @handle 90 as frog`)"]
     for p in AVATAR_POOL:
         fname = p.get("file") or ""
         if fname in seen:
@@ -2041,16 +2214,18 @@ def format_user_admin(user: dict) -> str:
     character = user.get("mascot") or user.get("animal") or "—"
     emoji = user.get("animal_emoji") or ""
     pin = "set" if user.get("pin_hash") else "not set"
-    gate = "in" if user_ai_enabled(user) else "out"
+    score = invite_score_for_user(user)
+    sees = "yes" if user_sees_games(user) else "no"
     return (
         f"**@{handle}**\n"
         f"- Character: {character} {emoji}\n"
         f"- PIN: {pin}\n"
-        f"- Gate: {gate}\n"
+        f"- Invite score: **{score}**/100 (admin only)\n"
+        f"- Sees games: {sees} (need ≥ {GAMES_VISIBLE_MIN})\n"
         f"- Gender: {user.get('gender') or '—'}\n"
         f"- Nationality: {user.get('nationality') or '—'}\n"
         f"- Age: {user.get('age_guess') or '—'}\n\n"
-        f"**Why this gate**\n{gate_story_for_admin(user)}\n\n"
+        f"**Why this score**\n{score_story_for_admin(user)}\n\n"
         f"**Why this character**\n{character_why_for_admin(user)}"
     )
 
@@ -2060,7 +2235,8 @@ def list_users(limit: int = 80) -> list[dict]:
         rows = conn.execute(
             """
             SELECT ig_handle, mascot, animal, animal_emoji, pin_hash,
-                   ai_enabled, gender, age_guess, nationality
+                   ai_enabled, gender, age_guess, nationality,
+                   invite_score, invite_score_override, gate_detail
             FROM users
             ORDER BY lower(ig_handle) ASC
             LIMIT ?
@@ -2080,10 +2256,10 @@ def users_as_context() -> str:
         character = u.get("mascot") or u.get("animal") or "—"
         emoji = (u.get("animal_emoji") or "").strip()
         pin = "PIN" if u.get("pin_hash") else "no PIN"
-        gate = "in" if user_ai_enabled(u) else "out"
+        score = invite_score_for_user(u)
         admin = " · admin" if normalize_handle(handle) in ADMIN_HANDLES else ""
         who = f"{character} {emoji}".strip()
-        lines.append(f"- @{handle}{admin} — {who} · gate {gate} · {pin}")
+        lines.append(f"- @{handle}{admin} — {who} · score {score} · {pin}")
     return f"**Members ({len(users)})**\n\n" + "\n".join(lines)
 
 
@@ -2126,29 +2302,28 @@ def admin_help_text() -> str:
         "4. **Delete a game** — `delete game #3`\n"
         "   Removes the game and all its signups.\n"
         "5. **Add a user** — `add user @handle 4821`\n"
-        "   Creates (or updates) a member with that PIN, gated in.\n"
+        "   Creates (or updates) a member with that PIN (score 90).\n"
         "6. **Delete a user** — `delete user @handle`\n"
         "   Removes the member and frees any held spots. Admin accounts are protected.\n"
-        "7. **Gate in** — `gate in @handle` or `gate in @handle as travel camel`\n"
-        "   Club chat. Optionally assign an animal photo at the same time.\n"
+        "7. **Invite score** — `score @handle` or `score @handle 90`\n"
+        "   View or set their silent invite score (0–100). Optional: `score @handle 90 as travel camel`.\n"
+        "   `rescore @handle` recomputes from gender/age (clears override).\n"
         "8. **Assign animal** — `assign @handle forehand frog` or `assign @handle surf_dog.png`\n"
         "   Swap their portrait. Type `animals` for the full list.\n"
-        "9. **Gate out** — `gate out @handle`\n"
-        "   Tennis stories only. They get **forehand frog**.\n"
-        "10. **User** — `user @handle`\n"
-        "   Profile, why they are gated in or out (including the 25% roll), and why that character.\n"
-        "11. **List users** — `list users` or `users`\n"
-        "   All members with gate / character / PIN status.\n"
-        "12. **Reset PIN** — `reset pin @handle 4821`\n"
+        "9. **User** — `user @handle`\n"
+        "   Profile, invite score breakdown (admin only), and why that character.\n"
+        "10. **List users** — `list users` or `users`\n"
+        "   All members with score / character / PIN status.\n"
+        "11. **Reset PIN** — `reset pin @handle 4821`\n"
         "   Sets a new 4-digit PIN.\n"
-        "13. **Board** — `games`\n"
+        "12. **Board** — `games`\n"
         "   List upcoming games (past dates are hidden).\n"
-        "14. **Signups** — `signups`\n"
+        "13. **Signups** — `signups`\n"
         "   Who registered for each upcoming game (@handles).\n"
-        "15. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
+        "14. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
         "   Drop them from a game and put the spot back.\n"
-        "16. **Help** — `help` or `/help`\n"
-        "17. **Log out** — `logout`"
+        "15. **Help** — `help` or `/help`\n"
+        "16. **Log out** — `logout`"
         f"{turso_note}"
     )
 
@@ -2267,11 +2442,11 @@ def try_admin_command(text: str) -> bool:
             append_assistant("Use `add user @handle 4821` with a valid handle and 4-digit PIN.")
         elif status == "created":
             append_assistant(
-                f"Added **@{handle}** with PIN `{pin}`, gated **in**."
+                f"Added **@{handle}** with PIN `{pin}` (invite score 90)."
             )
         else:
             append_assistant(
-                f"Updated **@{handle}** — PIN set to `{pin}`, gated **in**."
+                f"Updated **@{handle}** — PIN set to `{pin}`, invite score 90."
             )
         return True
     del_user = re.fullmatch(
@@ -2340,7 +2515,10 @@ def try_admin_command(text: str) -> bool:
                 "or type `animals` for the list."
             )
         elif status == "missing":
-            append_assistant(f"No account for **@{handle}** yet. `gate in @{handle} as {query}` also works.")
+            append_assistant(
+                f"No account for **@{handle}** yet. "
+                f"`score @{handle} 90 as {query}` also works."
+            )
         else:
             label = (user or {}).get("mascot") or (user or {}).get("animal") or query
             emoji = (user or {}).get("animal_emoji") or ""
@@ -2350,40 +2528,92 @@ def try_admin_command(text: str) -> bool:
                 image=photo if isinstance(photo, str) and os.path.isfile(photo) else None,
             )
         return True
+    score_cmd = re.fullmatch(
+        r"(?:/)?"
+        r"(?:score|invite\s*score)\s+@?([A-Za-z0-9._]{2,30})"
+        r"(?:\s+(\d{1,3}))?"
+        r"(?:\s+(?:as|to)\s+(.+))?",
+        raw,
+        re.I,
+    )
+    if score_cmd:
+        handle = normalize_handle(score_cmd.group(1))
+        score_raw = score_cmd.group(2)
+        animal_q = (score_cmd.group(3) or "").strip()
+        if score_raw is None:
+            user = get_user_by_handle(handle)
+            if not user:
+                append_assistant(f"No account for **@{handle}** yet.")
+            else:
+                append_assistant(format_user_admin(user))
+            return True
+        if animal_q and not resolve_pool_avatar(animal_q):
+            append_assistant(
+                f"Setting score for **@{handle}**, but I don’t know “{animal_q}”. "
+                "Type `animals` for names. Use `assign @handle …` after."
+            )
+            animal_q = ""
+        user = set_user_invite_score(handle, int(score_raw), animal_query=animal_q)
+        if not user:
+            append_assistant("Use `score @handle 90` with a score from 0–100.")
+            return True
+        n = invite_score_for_user(user)
+        label = user.get("mascot") or user.get("animal") or ""
+        extra = f" Character: **{label}**." if animal_q and label else ""
+        append_assistant(
+            f"**@{handle}** invite score set to **{n}**/100 "
+            f"(games visible: {'yes' if user_sees_games(user) else 'no'}).{extra}"
+        )
+        return True
+    rescore = re.fullmatch(
+        r"(?:/)?(?:rescore|recompute\s+score)\s+@?([A-Za-z0-9._]{2,30})",
+        raw,
+        re.I,
+    )
+    if rescore:
+        handle = normalize_handle(rescore.group(1))
+        user = refresh_user_invite_score(handle)
+        if not user:
+            append_assistant(f"No account for **@{handle}** yet.")
+        else:
+            append_assistant(
+                f"Rescored **@{handle}** from gender/age → **{invite_score_for_user(user)}**/100.\n\n"
+                f"{score_story_for_admin(user)}"
+            )
+        return True
     m = re.fullmatch(
         r"(?:/)?(?:gate|grant)\s+(in|out)\s+@?([A-Za-z0-9._]{2,30})"
         r"(?:\s+(?:as|to)\s+(.+))?",
         raw,
         re.I,
     )
-    if not m:
-        return False
-    enabled = m.group(1).lower() == "in"
-    handle = normalize_handle(m.group(2))
-    animal_q = (m.group(3) or "").strip()
-    if animal_q and not enabled:
-        append_assistant("Animal photos are for gated-in members. Use `gate in @handle as …` or `assign`.")
-        return True
-    if animal_q and not resolve_pool_avatar(animal_q):
+    if m:
+        enabled = m.group(1).lower() == "in"
+        handle = normalize_handle(m.group(2))
+        animal_q = (m.group(3) or "").strip()
+        n = 90 if enabled else 25
+        if animal_q and not enabled:
+            append_assistant(
+                f"Gate is gone — setting **@{handle}** to score **{n}** without changing animal. "
+                "Use `assign @handle …` if you want a portrait swap."
+            )
+            animal_q = ""
+        if animal_q and not resolve_pool_avatar(animal_q):
+            append_assistant(
+                f"Setting score **{n}** for **@{handle}**, but I don’t know “{animal_q}”. "
+                "Type `animals` for names."
+            )
+            animal_q = ""
+        user = set_user_invite_score(handle, n, animal_query=animal_q)
+        if not user:
+            append_assistant("That handle doesn’t look right. Try `score @name 90`.")
+            return True
         append_assistant(
-            f"Gating **@{handle}** in, but I don’t know “{animal_q}”. "
-            "Type `animals` for names. Use `assign @handle …` after."
+            f"Gate commands are retired — **@{handle}** invite score is now **{n}**/100. "
+            f"Prefer `score @{handle} {n}`."
         )
-        animal_q = ""
-    user = set_user_gate(handle, enabled, animal_q)
-    if not user:
-        append_assistant("That handle doesn’t look right. Try `gate in @name`.")
         return True
-    at = f"@{handle}"
-    if enabled:
-        label = user.get("mascot") or user.get("animal") or ""
-        extra = f" Character: **{label}**." if label else ""
-        append_assistant(f"**{at}** is gated **in**. They get club chat on their next message.{extra}")
-    else:
-        append_assistant(
-            f"**{at}** is gated **out**. They only get tennis stories, with **forehand frog** 🐸."
-        )
-    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -6508,105 +6738,302 @@ def _age_under_forty(age_guess: str) -> bool:
     )
 
 
+def _age_clearly_forty_plus(age_guess: str) -> bool:
+    s = (age_guess or "").strip().lower().replace("–", "-").replace("—", "-")
+    if not s or s in {"unknown", "n/a", "na", "?"}:
+        return False
+    if any(k in s for k in ("senior", "40s", "50s", "60s", "70s", "80s", "over 40", "40+", "40 +")):
+        return True
+    nums = [int(x) for x in re.findall(r"\d{2}", s)]
+    if nums:
+        return all(n >= 40 for n in nums) and max(nums) >= 40
+    return False
+
+
+def compute_invite_score(
+    demo: dict[str, str],
+    *,
+    override: Optional[int] = None,
+) -> tuple[int, str]:
+    """
+    Silent 0–100 invite score from gender + age. Never shown to members.
+    Target profile (female + under 40) ≈ 90; previous gate-out ≈ 15–25.
+    """
+    if override is not None:
+        try:
+            score = max(0, min(100, int(override)))
+        except (TypeError, ValueError):
+            score = 0
+        detail = (
+            f"Invite score **{score}**/100 (admin override).\n"
+            f"- Automatic gender/age check is ignored while override is set."
+        )
+        return score, detail
+
+    gender = (demo.get("gender") or "").strip().lower() or "unknown"
+    age = (demo.get("age_guess") or "").strip() or "unknown"
+
+    if gender == "female":
+        g_pts, g_why = 50, "female"
+    elif gender == "male":
+        g_pts, g_why = 5, "male"
+    else:
+        g_pts, g_why = 15, "unknown"
+
+    if _age_under_forty(age):
+        a_pts, a_why = 40, "clearly under 40"
+    elif _age_clearly_forty_plus(age):
+        a_pts, a_why = 0, "clearly 40+"
+    else:
+        a_pts, a_why = 10, "unclear / unknown"
+
+    score = max(0, min(100, g_pts + a_pts))
+    detail = (
+        f"Invite score **{score}**/100 (admin only — never tell the member).\n"
+        f"- Gender: {gender} → +{g_pts} ({g_why})\n"
+        f"- Age: {age} → +{a_pts} ({a_why})\n"
+        f"- Games visible if score ≥ {GAMES_VISIBLE_MIN}; "
+        f"invite pass ≈ {INVITE_PASS_THRESHOLD} × urgency × luck."
+    )
+    return score, detail
+
+
+def invite_score_for_user(user: Optional[dict]) -> int:
+    if not user:
+        return 0
+    if is_admin(user):
+        return 100
+    raw_ov = user.get("invite_score_override")
+    if raw_ov is not None and str(raw_ov).strip() != "":
+        try:
+            return max(0, min(100, int(raw_ov)))
+        except (TypeError, ValueError):
+            pass
+    raw = user.get("invite_score")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0, min(100, int(raw)))
+        except (TypeError, ValueError):
+            pass
+    demo = {
+        "gender": user.get("gender") or "",
+        "age_guess": user.get("age_guess") or "",
+    }
+    score, _ = compute_invite_score(demo)
+    return score
+
+
+def user_sees_games(user: Optional[dict] = None) -> bool:
+    """Whether Join / Games board / invites are offered. Chat is always open."""
+    u = user or st.session_state.get("user")
+    if not u:
+        return False
+    if is_admin(u):
+        return True
+    return invite_score_for_user(u) >= GAMES_VISIBLE_MIN
+
+
+def score_story_for_admin(user: dict) -> str:
+    if is_admin(user):
+        return "Admin account. Invite score does not apply (treated as 100)."
+    stored = (user.get("gate_detail") or "").strip()
+    ov = user.get("invite_score_override")
+    override = None
+    if ov is not None and str(ov).strip() != "":
+        try:
+            override = int(ov)
+        except (TypeError, ValueError):
+            override = None
+    demo = {
+        "gender": user.get("gender") or "",
+        "age_guess": user.get("age_guess") or "",
+    }
+    if override is not None or any(str(v).strip() for v in demo.values()):
+        _score, detail = compute_invite_score(demo, override=override)
+        return detail
+    if stored:
+        return stored
+    return "No gender/age saved yet — score defaults from unknown signals."
+
+
+def set_user_invite_score(
+    ig_handle: str,
+    score: int,
+    *,
+    animal_query: str = "",
+) -> Optional[dict]:
+    """Admin override invite score (0–100). Optionally assign an animal."""
+    handle = normalize_handle(ig_handle)
+    if not handle or not re.match(r"^[A-Za-z0-9._]{2,30}$", handle):
+        return None
+    try:
+        n = max(0, min(100, int(score)))
+    except (TypeError, ValueError):
+        return None
+    detail = (
+        f"Invite score **{n}**/100 (admin override).\n"
+        f"- Automatic gender/age check is ignored while override is set."
+    )
+    avatar = resolve_pool_avatar(animal_query) if animal_query else None
+    with get_conn() as conn:
+        existing = _as_dict(
+            conn.execute(
+                "SELECT id FROM users WHERE lower(ig_handle) = ?",
+                (handle,),
+            ).fetchone()
+        )
+        if existing.get("id") is not None:
+            conn.execute(
+                """
+                UPDATE users
+                SET invite_score = ?, invite_score_override = ?, gate_detail = ?,
+                    ai_enabled = 1, gate_override = NULL
+                WHERE id = ?
+                """,
+                (n, n, detail, existing["id"]),
+            )
+            if avatar:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET animal = ?, mascot = ?, animal_emoji = ?, avatar_path = ?,
+                        assign_why = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        avatar["label"],
+                        avatar["label"],
+                        avatar.get("emoji") or "🎾",
+                        avatar["file"],
+                        f"Admin assigned {avatar['label']} with invite score {n}.",
+                        existing["id"],
+                    ),
+                )
+        else:
+            animal = avatar["label"] if avatar else "tennis cat"
+            emoji = avatar.get("emoji") if avatar else "🐱"
+            file_name = avatar["file"] if avatar else "crosscourt_cat.png"
+            conn.execute(
+                """
+                INSERT INTO users (
+                    ig_handle, pin_hash, animal, vibe, animal_emoji, mascot,
+                    avatar_path, ai_enabled, invite_score, invite_score_override,
+                    gate_detail, assign_why
+                )
+                VALUES (?, NULL, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    handle,
+                    animal,
+                    "Added by admin.",
+                    emoji or "🎾",
+                    animal,
+                    file_name,
+                    n,
+                    n,
+                    detail,
+                    f"Admin created row with invite score {n}.",
+                ),
+            )
+    return get_user_by_handle(handle)
+
+
+def refresh_user_invite_score(ig_handle: str) -> Optional[dict]:
+    """Recompute score from stored demographics (clears admin override)."""
+    handle = normalize_handle(ig_handle)
+    user = get_user_by_handle(handle)
+    if not user:
+        return None
+    demo = {
+        "gender": user.get("gender") or "",
+        "age_guess": user.get("age_guess") or "",
+    }
+    score, detail = compute_invite_score(demo)
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET invite_score = ?, invite_score_override = NULL, gate_detail = ?,
+                ai_enabled = 1
+            WHERE lower(ig_handle) = ?
+            """,
+            (score, detail, handle),
+        )
+    return get_user_by_handle(handle)
+
+
+def backfill_invite_scores() -> int:
+    """Assign invite_score from demographics for rows missing a score."""
+    fixed = 0
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, ig_handle, gender, age_guess, invite_score, invite_score_override
+            FROM users
+            """
+        ).fetchall()
+        for r in rows:
+            u = _as_dict(r)
+            if u.get("invite_score") is not None and str(u.get("invite_score")).strip() != "":
+                # Still ensure ai_enabled is on for everyone
+                continue
+            ov = u.get("invite_score_override")
+            override = None
+            if ov is not None and str(ov).strip() != "":
+                try:
+                    override = int(ov)
+                except (TypeError, ValueError):
+                    override = None
+            demo = {
+                "gender": u.get("gender") or "",
+                "age_guess": u.get("age_guess") or "",
+            }
+            score, detail = compute_invite_score(demo, override=override)
+            conn.execute(
+                """
+                UPDATE users
+                SET invite_score = ?, gate_detail = ?, ai_enabled = 1
+                WHERE id = ?
+                """,
+                (score, detail, int(u["id"])),
+            )
+            fixed += 1
+        # Open club chat for anyone still marked ai_enabled=0
+        conn.execute("UPDATE users SET ai_enabled = 1 WHERE ai_enabled IS NULL OR ai_enabled = 0")
+    return fixed
+
+
 def club_ai_eligible(demo: dict[str, str]) -> tuple[bool, str]:
-    """
-    In only when both hold: female, and age clearly under 40.
-    Unknown gender or age is gated. Nationality is not a gate.
-    """
+    """Compat: True when auto score would clear the games-visibility floor."""
+    score, _ = compute_invite_score(demo)
+    if score >= GAMES_VISIBLE_MIN:
+        return True, ""
     gender = (demo.get("gender") or "").strip().lower()
     if gender != "female":
         return False, "gender"
     if not _age_under_forty(demo.get("age_guess") or ""):
         return False, "age"
-    return True, ""
-
-
-def _gate_check_lines(demo: dict[str, str]) -> str:
-    gender = (demo.get("gender") or "unknown").strip() or "unknown"
-    age = (demo.get("age_guess") or "unknown").strip() or "unknown"
-    g_ok = gender.lower() == "female"
-    a_ok = _age_under_forty(age)
-    return (
-        f"- Gender: {gender} — {'pass' if g_ok else 'fail (need female)'}\n"
-        f"- Age: {age} — {'pass' if a_ok else 'fail (need clearly under 40)'}"
-    )
-
-
-def describe_gate(
-    demo: dict[str, str],
-    *,
-    override: Optional[bool],
-    auto_ok: bool,
-    auto_reason: str,
-    final_ok: bool,
-) -> str:
-    checks = _gate_check_lines(demo)
-    fails = {
-        "gender": "gender is not female",
-        "age": "age is not clearly under 40",
-    }
-    fail = fails.get(auto_reason or "", auto_reason or "a check failed")
-    if override is True:
-        head = "Admin forced them in. The automatic check is ignored."
-    elif override is False:
-        head = "Admin forced them out. The 25% roll does not apply."
-    elif auto_ok and final_ok:
-        head = "Gated in. Gender and age both passed."
-    elif (not auto_ok) and final_ok:
-        head = f"Automatic gate was out ({fail}). Let in on the 25% roll."
-    elif not auto_ok:
-        head = f"Gated out. {fail[0].upper() + fail[1:]}."
-    else:
-        head = "Checks would pass, but they are marked out."
-    return f"{head}\n{checks}"
+    return False, "score"
 
 
 def settle_gate(handle: str, demo: dict[str, str]) -> tuple[bool, str]:
-    """Apply admin lock, then the silent 25% roll. Returns (in?, admin-only explanation)."""
+    """Compat wrapper — everyone is in; returns (True, score detail)."""
+    user = get_user_by_handle(handle) or {}
+    ov = user.get("invite_score_override")
+    override = None
+    if ov is not None and str(ov).strip() != "":
+        try:
+            override = int(ov)
+        except (TypeError, ValueError):
+            override = None
     if normalize_handle(handle) in ADMIN_HANDLES:
-        return True, "Admin account. The gate does not apply."
-    auto_ok, auto_reason = club_ai_eligible(demo)
-    override = gate_override_for(handle)
-    after_admin = auto_ok if override is None else bool(override)
-    final = maybe_lucky_in(handle, after_admin)
-    detail = describe_gate(
-        demo,
-        override=override,
-        auto_ok=auto_ok,
-        auto_reason=auto_reason,
-        final_ok=final,
-    )
-    return final, detail
+        return True, "Admin account. Invite score does not apply."
+    _score, detail = compute_invite_score(demo, override=override)
+    return True, detail
 
 
 def gate_story_for_admin(user: dict) -> str:
-    if is_admin(user):
-        return "Admin account. The gate does not apply."
-    demo = {
-        "gender": user.get("gender") or "",
-        "nationality": user.get("nationality") or "",
-        "age_guess": user.get("age_guess") or "",
-    }
-    if not any(v.strip() for v in demo.values()):
-        stored = (user.get("gate_detail") or "").strip()
-        return stored or "No gender or age saved yet."
-    auto_ok, auto_reason = club_ai_eligible(demo)
-    raw = user.get("gate_override")
-    override = None if raw is None else bool(int(raw))
-    if override is True:
-        final = True
-    elif override is False:
-        final = False
-    else:
-        ai = user.get("ai_enabled")
-        final = bool(int(ai)) if ai is not None else auto_ok
-    return describe_gate(
-        demo,
-        override=override,
-        auto_ok=auto_ok,
-        auto_reason=auto_reason,
-        final_ok=final,
-    )
+    return score_story_for_admin(user)
 
 
 def character_why_for_admin(user: dict) -> str:
@@ -6624,7 +7051,7 @@ def character_why_for_admin(user: dict) -> str:
 
 
 def assign_club_tennis() -> tuple[str, str, str, str, str]:
-    """Fallback identity for gated-out members: forehand frog."""
+    """Legacy frog fallback — prefer bio match; kept for admin assign aliases."""
     return (
         GATE_OUT_LABEL,
         "Here’s your **forehand frog** — let’s get you a PIN and onto the court.",
@@ -6635,15 +7062,9 @@ def assign_club_tennis() -> tuple[str, str, str, str, str]:
 
 
 def user_ai_enabled(user: Optional[dict] = None) -> bool:
+    """Everyone with an account gets club chat. Use user_sees_games for game UI."""
     u = user or st.session_state.get("user")
-    if not u:
-        return False
-    if is_admin(u):
-        return True
-    val = u.get("ai_enabled")
-    if val is None:
-        return True
-    return bool(int(val)) if not isinstance(val, bool) else val
+    return bool(u)
 
 
 def format_api_error(exc: Exception) -> str:
@@ -8314,10 +8735,10 @@ def run_quick_action(action: str) -> None:
         open_g = next((g for g in list_games() if int(g.get("spots") or 0) > 0), None)
         when_bit = short_game_when((open_g or {}).get("when_text") or "")
         append_user(f"Join {when_bit}", avatar=avatar)
-        if not user_ai_enabled(user) and not is_admin(user):
+        if not user_sees_games(user):
             append_assistant(
-                "Club game join is for gated-in members. "
-                "You can still check the **Board** for what’s coming up."
+                "No open spots for you on the board right now — "
+                "ask about tennis gear, weather, or courts anytime."
             )
             return
         status, game = join_next_game(user.get("ig_handle") or "")
@@ -8325,6 +8746,9 @@ def run_quick_action(action: str) -> None:
         return
     if key == "board":
         append_user("Games", avatar=avatar)
+        if not user_sees_games(user):
+            append_assistant("Nothing on your game board right now — tennis chat is still open.")
+            return
         append_assistant(games_board_markdown())
         return
     if key in {"help", "tips"}:
@@ -8344,12 +8768,12 @@ def render_quick_actions() -> Optional[str]:
     if not user:
         return None
 
-    upcoming = list_games()
+    upcoming = list_games() if user_sees_games(user) else []
     open_games = [g for g in upcoming if int(g.get("spots") or 0) > 0]
-    can_join = bool(open_games) and bool(user_ai_enabled(user) or is_admin(user))
+    can_join = bool(open_games)
 
     labels: list[tuple[str, str]] = []
-    # Only offer Join / Games when there is something on the schedule
+    # Only offer Join / Games when score allows and something is scheduled
     if can_join:
         when_bit = short_game_when(open_games[0].get("when_text") or "")
         labels.append(("join", f"🎾 Join {when_bit}"))
@@ -8463,7 +8887,7 @@ def _begin_pin_signup(
     scrape: dict[str, Any],
     eligible: bool,
 ) -> None:
-    """Shared PIN signup prompt — same surface UX for AI and gated members."""
+    """Shared PIN signup prompt — everyone gets a matched character + club chat."""
     st.session_state.pending_handle = handle
     st.session_state.pending_animal = display_name
     st.session_state.pending_vibe = vibe
@@ -8472,17 +8896,12 @@ def _begin_pin_signup(
     st.session_state.pending_avatar = avatar_path
     st.session_state.pending_ig_photo = ig_photo
     st.session_state.auth_state = NEED_PIN_SIGNUP
-    if not eligible:
-        _lock_handle_session(handle)
 
     photo_path = animal_photo_path(mascot, avatar_path)
-    if eligible:
-        body = (
-            f"{character_reveal(mascot or display_name, emoji)}\n\n"
-            "Set a **4-digit PIN** to lock it in."
-        )
-    else:
-        body = "Set a **4-digit PIN** to save your spot (numbers only)."
+    body = (
+        f"{character_reveal(mascot or display_name, emoji)}\n\n"
+        "Set a **4-digit PIN** to lock it in."
+    )
     append_assistant(
         body,
         image=photo_path if isinstance(photo_path, str) and os.path.isfile(photo_path) else None,
@@ -8559,9 +8978,7 @@ def _prepare_ig_signup(handle: str) -> dict[str, Any]:
                 "mascot": mascot,
                 "avatar_path": avatar_path,
                 "ig_photo": ig_photo,
-                "lock": bool(
-                    existing.get("ai_enabled") is not None and not int(existing.get("ai_enabled") or 0)
-                ),
+                "lock": False,
             }
         drop_unfinished_handle(handle)
         return {"action": "unreadable", "at": at}
@@ -8571,17 +8988,28 @@ def _prepare_ig_signup(handle: str) -> dict[str, Any]:
     demo = resolved["demo"]
     _apply_hk_name_prior(handle, demo)
 
-    eligible, gate_detail = settle_gate(handle, demo)
-    if eligible:
-        display_name, vibe, emoji, mascot, avatar_path = assign_animal_and_vibe(
-            handle, scraped_text, scrape=scrape
-        )
-        ai_flag = 1
-        assign_why = (scrape or {}).get("assign_why") or ""
-    else:
-        display_name, vibe, emoji, mascot, avatar_path = assign_club_tennis()
-        ai_flag = 0
-        assign_why = "Forehand frog — the gate kept them out, so they did not get a matched animal."
+    _in, score_detail = settle_gate(handle, demo)
+    override = None
+    if existing is not None:
+        ov = existing.get("invite_score_override")
+        if ov is not None and str(ov).strip() != "":
+            try:
+                override = int(ov)
+            except (TypeError, ValueError):
+                override = None
+    score, detail = compute_invite_score(
+        {
+            "gender": demo.get("gender") or "",
+            "age_guess": demo.get("age_guess") or "",
+        },
+        override=override,
+    )
+    if not detail:
+        detail = score_detail
+    display_name, vibe, emoji, mascot, avatar_path = assign_animal_and_vibe(
+        handle, scraped_text, scrape=scrape
+    )
+    assign_why = (scrape or {}).get("assign_why") or ""
 
     upsert_pending_user(
         handle,
@@ -8594,9 +9022,10 @@ def _prepare_ig_signup(handle: str) -> dict[str, Any]:
         gender=demo.get("gender") or "",
         nationality=demo.get("nationality") or "",
         age_guess=demo.get("age_guess") or "",
-        ai_enabled=ai_flag,
-        gate_detail=gate_detail,
+        ai_enabled=1,
+        gate_detail=detail,
         assign_why=assign_why,
+        invite_score=score,
     )
     return {
         "action": "pin_signup",
@@ -8607,7 +9036,7 @@ def _prepare_ig_signup(handle: str) -> dict[str, Any]:
         "mascot": mascot,
         "avatar_path": avatar_path,
         "ig_photo": ig_photo,
-        "eligible": bool(eligible),
+        "eligible": True,
     }
 
 
@@ -8763,8 +9192,6 @@ def handle_need_ig(text: str) -> None:
         photo = animal_photo_path(existing.get("mascot") or animal, existing.get("avatar_path"))
         ig_photo = existing.get("ig_photo_path") or ""
         ensure_ig_profile_photo(handle, ig_photo)
-        if not user_ai_enabled(existing):
-            _lock_handle_session(handle)
         append_assistant(
             f"Welcome back, {at} — **{animal}** {emoji}\n\n"
             f"Enter your **4-digit PIN** to unlock the club chat.",
@@ -8774,12 +9201,12 @@ def handle_need_ig(text: str) -> None:
 
     # Incomplete signup — resume PIN only when we already have a solid assignment
     if existing and not existing.get("pin_hash") and existing.get("animal"):
-        was_gated = existing.get("ai_enabled") is not None and not int(existing.get("ai_enabled") or 0)
         g0 = (existing.get("gender") or "").strip().lower()
         a0 = (existing.get("age_guess") or "").strip().lower()
         thin_demo = (not g0 or g0 == "unknown") or (not a0 or a0 in {"unknown", "n/a", "na", "?"})
         empty_why = not (existing.get("assign_why") or "").strip()
-        needs_rescan = (was_gated or thin_demo or empty_why) and not is_admin(existing)
+        missing_score = existing.get("invite_score") is None
+        needs_rescan = (thin_demo or empty_why or missing_score) and not is_admin(existing)
         if not needs_rescan:
             mascot = existing.get("mascot") or existing.get("animal") or handle
             animal_raw = existing.get("animal") or mascot
@@ -8796,8 +9223,6 @@ def handle_need_ig(text: str) -> None:
             st.session_state.pending_avatar = avatar_path
             st.session_state.pending_ig_photo = ig_photo
             st.session_state.auth_state = NEED_PIN_SIGNUP
-            if was_gated:
-                _lock_handle_session(handle)
             photo_path = animal_photo_path(mascot, avatar_path)
             append_assistant(
                 f"Welcome back mid-signup, {at} — you’re still **{display_name}** {emoji}\n\n"
@@ -8827,14 +9252,7 @@ def handle_need_pin_signup(text: str) -> None:
     persist_login(user)
     animal = user.get("mascot") or user.get("animal") or "player"
     emoji = user.get("animal_emoji") or "🎾"
-    if not user_ai_enabled(user):
-        _lock_handle_session(user.get("ig_handle") or st.session_state.pending_handle)
-        append_assistant(
-            f"You’re in, **{animal}** {emoji}\n\n"
-            + guest_tennis_story_reply("", remind_ig=False)
-        )
-        return
-    invite = maybe_game_invite()
+    invite = maybe_game_invite(user=user) if user_sees_games(user) else ""
     notices = consume_admin_signup_notices() if is_admin(user) else ""
     notice_bit = f"\n\n{notices}" if notices else ""
     append_assistant(
@@ -8880,17 +9298,15 @@ def handle_need_pin_login(text: str) -> None:
     persist_login(user)
     animal = user.get("mascot") or user.get("animal") or "player"
     emoji = user.get("animal_emoji") or "🎾"
-    if not user_ai_enabled(user):
-        _lock_handle_session(user.get("ig_handle") or "")
-        append_assistant(
-            f"Back on court, **{animal}** {emoji}\n\n"
-            + guest_tennis_story_reply("", remind_ig=False)
-        )
-        return
-    invite = maybe_game_invite()
+    invite = maybe_game_invite(user=user) if user_sees_games(user) else ""
+    opener = (
+        "What do you want to know about upcoming games?"
+        if user_sees_games(user)
+        else "Ask me anything tennis — racquets, weather, courts, vibes."
+    )
     append_assistant(
         f"Back on court, **{animal}** {emoji}\n\n"
-        "What do you want to know about upcoming games?"
+        + opener
         + invite
     )
 
@@ -8907,20 +9323,12 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     persist_login(fresh)
     animal = fresh.get("mascot") or fresh.get("animal") or "player"
     emoji = fresh.get("animal_emoji") or "🎾"
-    invite = maybe_game_invite() if user_ai_enabled(fresh) else ""
+    invite = maybe_game_invite(user=fresh) if user_sees_games(fresh) else ""
     notices = consume_admin_signup_notices() if is_admin(fresh) else ""
     notice_bit = f"\n\n{notices}" if notices else ""
     notice_bit += persistence_warning_for_admin() if is_admin(fresh) else ""
     photo = animal_photo_path(animal, fresh.get("avatar_path"))
     photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
-    if not user_ai_enabled(fresh):
-        append_assistant(
-            f"{welcome}, **{animal}** {emoji}\n\n"
-            + guest_tennis_story_reply("", remind_ig=False)
-            + notice_bit,
-            image=photo_path,
-        )
-        return
     append_assistant(
         f"{welcome}, **{animal}** {emoji}\n\n"
         "Type `help` for admin commands."
@@ -8935,9 +9343,6 @@ def handle_logged_in(text: str) -> None:
     lower = text.strip().lower()
 
     if lower in {"logout", "log out", "restart"}:
-        if st.session_state.get("handle_locked") and not user_ai_enabled(user):
-            append_assistant(guest_tennis_story_reply(text, remind_ig=False))
-            return
         st.session_state.auth_state = NEED_IG
         st.session_state.user = None
         st.session_state.pending_handle = ""
@@ -8949,13 +9354,16 @@ def handle_logged_in(text: str) -> None:
 
     # One-tap / typed shortcuts for everyone logged in
     if lower in {"board", "games", "/games", "list games", "upcoming", "upcoming games"}:
+        if not user_sees_games(user) and not is_admin(user):
+            append_assistant("Nothing on your game board right now — tennis chat is still open.")
+            return
         append_assistant(games_board_markdown())
         return
     if lower in {"join", "join next", "join game", "sign up", "signup"}:
-        if not user_ai_enabled(user) and not is_admin(user):
+        if not user_sees_games(user):
             append_assistant(
-                "Club game join is for gated-in members. "
-                "You can still check the **Board** for what’s coming up."
+                "No open spots for you on the board right now — "
+                "ask about tennis gear, weather, or courts anytime."
             )
             return
         status, game = join_next_game(user.get("ig_handle") or "")
@@ -8965,7 +9373,7 @@ def handle_logged_in(text: str) -> None:
         append_assistant(member_tips_text())
         return
 
-    # Admin commands: help, games, gate in/out, add game
+    # Admin commands: help, games, score, add game
     if is_admin(user):
         if try_admin_command(text):
             return
@@ -8992,41 +9400,39 @@ def handle_logged_in(text: str) -> None:
             )
             return
 
-    # Gated members: no DeepSeek — tennis stories only
-    if not user_ai_enabled(user):
-        append_assistant(guest_tennis_story_reply(text, remind_ig=False))
-        return
-
-    if not is_admin(user) and _confirms_game_join(text, _last_assistant_text()):
+    if user_sees_games(user) and not is_admin(user) and _confirms_game_join(text, _last_assistant_text()):
         status, game = join_next_game(user.get("ig_handle") or "")
         append_assistant(game_join_reply(status, game))
         return
 
-    games = list_games()
+    games = list_games() if user_sees_games(user) or is_admin(user) else []
     if games:
         game_rule = (
             "You may invite them to one game that is actually listed above, "
             "with its date, time, location, and spots. "
-            "Do not promise to flag or notify them later."
+            "Do not promise to flag or notify them later. "
+            "Keep invites casual (not like a system notice)."
         )
     else:
         game_rule = (
-            "There are no games scheduled. If they ask, say there is no game. "
+            "Do not mention specific club game slots or invite them to join a listed game. "
+            "Talk tennis generally (gear, weather, courts, vibes). "
             "Do not offer to flag, notify, or watch for a future post."
         )
     extra = (
         f"Member: @{user.get('ig_handle')} · mascot {user.get('animal')}.\n"
-        f"{games_as_context()}\n"
-        f"{game_rule}\n"
+        + (f"{games_as_context()}\n" if games else "No scheduled games are visible to this member.\n")
+        + f"{game_rule}\n"
         "Trust only the live Scheduled games block above for what exists. "
-        "Never invent games, signups, or members from earlier chat messages."
+        "Never invent games, signups, or members from earlier chat messages. "
+        "Never mention invite scores, gates, eligibility, or targeting."
     )
     if is_admin(user):
         extra += (
             "\nThis sender is a club admin. Never say you lack admin access. "
-            "For member lists, signups, gates, or PIN resets, tell them to type "
+            "For member lists, signups, scores, or PIN resets, tell them to type "
             "`help` for the exact admin commands (e.g. `list users`, `signups`, "
-            "`user @handle`)."
+            "`user @handle`, `score @handle`)."
         )
     history: list[dict[str, str]] = []
     for msg in st.session_state.messages[-10:]:
@@ -9036,7 +9442,7 @@ def handle_logged_in(text: str) -> None:
 
     with st.spinner("Thinking…"):
         reply = deepseek_chat(history, extra_system=extra)
-    append_assistant(reply + maybe_game_invite(reply))
+    append_assistant(reply + maybe_game_invite(reply, user=user))
 
 
 def process_user_input(text: str) -> None:
@@ -9088,9 +9494,9 @@ def placeholder_for_state() -> str:
             "help"
             if is_admin(st.session_state.user)
             else (
-                "Say hi…"
-                if st.session_state.user and not user_ai_enabled(st.session_state.user)
-                else "Any games this weekend?"
+                "Any games this weekend?"
+                if st.session_state.user and user_sees_games(st.session_state.user)
+                else "Say hi…"
             )
         ),
     }.get(state, "Message…")
