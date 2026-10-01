@@ -2107,6 +2107,55 @@ def is_admin(user: Optional[dict]) -> bool:
     return normalize_handle(user.get("ig_handle", "")) in ADMIN_HANDLES
 
 
+def is_impersonating() -> bool:
+    return bool(st.session_state.get("admin_real_user"))
+
+
+def admin_actor() -> Optional[dict]:
+    """The real admin account even while tasting a member chat."""
+    real = st.session_state.get("admin_real_user")
+    if real:
+        return real
+    user = st.session_state.get("user")
+    return user if is_admin(user) else None
+
+
+def start_impersonation(target_handle: str) -> tuple[str, Optional[dict]]:
+    """
+    Switch the session into a member's shoes (chat / games / invites).
+    Admin cookie stays put; type `back` to return.
+    """
+    admin = admin_actor()
+    if not admin:
+        return "not_admin", None
+    handle = normalize_handle(target_handle)
+    if not handle:
+        return "bad", None
+    if normalize_handle(admin.get("ig_handle") or "") == handle:
+        return "self", admin
+    target = get_user_by_handle(handle)
+    if not target:
+        return "missing", None
+    if is_admin(target):
+        return "admin_target", target
+    if not st.session_state.get("admin_real_user"):
+        st.session_state.admin_real_user = dict(admin)
+    st.session_state.user = target
+    st.session_state.handle_locked = False
+    st.session_state.locked_handle = ""
+    return "ok", target
+
+
+def stop_impersonation() -> tuple[str, Optional[dict]]:
+    real = st.session_state.pop("admin_real_user", None)
+    if not real:
+        return "none", st.session_state.get("user")
+    st.session_state.user = real
+    st.session_state.handle_locked = False
+    st.session_state.locked_handle = ""
+    return "ok", real
+
+
 def gate_override_for(ig_handle: str) -> Optional[bool]:
     """Admin lock: True = forced in, False = forced out, None = automatic."""
     user = get_user_by_handle(ig_handle)
@@ -2292,38 +2341,23 @@ def admin_help_text() -> str:
         )
     return (
         "**Admin commands**\n\n"
-        f"1. **Add a game** — `Add game Sat 5pm` (defaults to **{DEFAULT_GAME_SPOTS} pax**; "
-        "you are auto-signed as player 1)\n"
-        f"   Saved as **Sept 26 (Saturday) @ 5pm** style. Location defaults to **{DEFAULT_GAME_LOCATION}**.\n"
-        "2. **Fill / full** — `full game #3` or `fill game #3`\n"
-        "   Mark the game full (0 spots left / fill the headcount).\n"
-        "3. **Set spots** — `spots #3 2` or `amend game #3 spots 2`\n"
-        "   Set remaining open spots (use `0` to fill).\n"
-        "4. **Delete a game** — `delete game #3`\n"
-        "   Removes the game and all its signups.\n"
-        "5. **Add a user** — `add user @handle 4821`\n"
-        "   Creates (or updates) a member with that PIN (score 90).\n"
-        "6. **Delete a user** — `delete user @handle`\n"
-        "   Removes the member and frees any held spots. Admin accounts are protected.\n"
-        "7. **Invite score** — `score @handle` or `score @handle 90`\n"
-        "   View or set their silent invite score (0–100). Optional: `score @handle 90 as travel camel`.\n"
-        "   `rescore @handle` recomputes from gender/age (clears override).\n"
-        "8. **Assign animal** — `assign @handle forehand frog` or `assign @handle surf_dog.png`\n"
-        "   Swap their portrait. Type `animals` for the full list.\n"
-        "9. **User** — `user @handle`\n"
-        "   Profile, invite score breakdown (admin only), and why that character.\n"
-        "10. **List users** — `list users` or `users`\n"
-        "   All members with score / character / PIN status.\n"
-        "11. **Reset PIN** — `reset pin @handle 4821`\n"
-        "   Sets a new 4-digit PIN.\n"
-        "12. **Board** — `games`\n"
-        "   List upcoming games (past dates are hidden).\n"
-        "13. **Signups** — `signups`\n"
-        "   Who registered for each upcoming game (@handles).\n"
-        "14. **Remove signup** — `remove @handle` or `remove @handle from #3`\n"
-        "   Drop them from a game and put the spot back.\n"
-        "15. **Help** — `help` or `/help`\n"
-        "16. **Log out** — `logout`"
+        "**Games**\n"
+        f"- `Add game Sat 5pm` — **{DEFAULT_GAME_SPOTS} pax**, you auto-join as #1 "
+        f"(format **Sept 26 (Saturday) @ 5pm**, default **{DEFAULT_GAME_LOCATION}**)\n"
+        "- `full game #3` / `spots #3 2` — fill headcount or set open spots\n"
+        "- `delete game #3` — remove game + signups\n"
+        "- `games` / `signups` — board & who’s in\n"
+        "- `remove @handle` or `remove @handle from #3` — free a spot\n\n"
+        "**Members**\n"
+        "- `user @handle` — profile + invite score (admin only)\n"
+        "- `users` — member list with scores\n"
+        "- `score @handle` / `score @handle 90` / `rescore @handle` — view, override, or recompute score\n"
+        "- `assign @handle travel camel` — portrait (`animals` for the list)\n"
+        "- `add user @handle 4821` / `delete user @handle` / `reset pin @handle 4821`\n\n"
+        "**Taste their chat**\n"
+        "- `as @handle` — impersonate (see games/invites as they do). Type `back` to return.\n\n"
+        "**Other**\n"
+        "- `help` · `logout`"
         f"{turso_note}"
     )
 
@@ -2337,6 +2371,44 @@ def try_admin_command(text: str) -> bool:
         return True
     if lower in {"animals", "/animals", "list animals", "avatars", "photos"}:
         append_assistant(animals_as_context())
+        return True
+    # Impersonation exit — also reachable while tasting a member (see handle_logged_in)
+    if lower in {"back", "unimpersonate", "as me", "stop as", "stop impersonating"}:
+        status, real = stop_impersonation()
+        if status == "none":
+            append_assistant("You’re not impersonating anyone.")
+        else:
+            at = format_handle((real or {}).get("ig_handle") or "admin")
+            append_assistant(f"Back as **{at}**. Type `help` for admin commands.")
+        return True
+    as_cmd = re.fullmatch(
+        r"(?:/)?(?:as|impersonate|sudo|become)\s+@?([A-Za-z0-9._]{2,30})",
+        raw,
+        re.I,
+    )
+    if as_cmd:
+        handle = normalize_handle(as_cmd.group(1))
+        status, target = start_impersonation(handle)
+        if status == "not_admin":
+            append_assistant("Only admins can impersonate.")
+        elif status == "bad":
+            append_assistant("Use `as @handle`.")
+        elif status == "self":
+            append_assistant("That’s already you.")
+        elif status == "missing":
+            append_assistant(f"No account for **@{handle}**.")
+        elif status == "admin_target":
+            append_assistant("Can’t impersonate another admin account.")
+        else:
+            score = invite_score_for_user(target or {})
+            sees = "yes" if user_sees_games(target) else "no"
+            animal = (target or {}).get("mascot") or (target or {}).get("animal") or "player"
+            emoji = (target or {}).get("animal_emoji") or "🎾"
+            append_assistant(
+                f"Now chatting as **@{handle}** — **{animal}** {emoji}\n"
+                f"_(score {score}, games visible: {sees} — admin only)_\n\n"
+                "Talk like they would. Type `back` when you’re done."
+            )
         return True
     if lower in {"games", "/games", "list games", "upcoming", "upcoming games", "board"}:
         append_assistant(games_board_markdown())
@@ -7657,6 +7729,7 @@ def ensure_session() -> None:
         "handle_locked": False,
         "locked_handle": "",
         "user": None,
+        "admin_real_user": None,
         "messages": [],
     }
     for k, v in defaults.items():
@@ -8808,7 +8881,7 @@ def render_mascot_banner(user: dict) -> None:
     photo = animal_photo_path(user.get("mascot") or user.get("animal"), user.get("avatar_path"))
     animal = user.get("mascot") or user.get("animal") or "Player"
     handle = user.get("ig_handle") or ""
-    admin = " · admin" if is_admin(user) else ""
+    admin = " · admin" if is_admin(user) and not is_impersonating() else ""
     cols = st.columns([1, 4])
     with cols[0]:
         st.markdown('<div class="mascot-zoom">', unsafe_allow_html=True)
@@ -8819,7 +8892,12 @@ def render_mascot_banner(user: dict) -> None:
         st.markdown("</div>", unsafe_allow_html=True)
     with cols[1]:
         st.markdown(f"**{animal}**{admin}")
-        st.caption(f"@{handle}")
+        if is_impersonating():
+            real = st.session_state.get("admin_real_user") or {}
+            real_at = format_handle(real.get("ig_handle") or "admin")
+            st.caption(f"@{handle} · tasting as member · `{real_at}` type `back`")
+        else:
+            st.caption(f"@{handle}")
 
 QUOTES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tennis_quotes.json")
 
@@ -9342,7 +9420,21 @@ def handle_logged_in(text: str) -> None:
     user = st.session_state.user
     lower = text.strip().lower()
 
+    # Exit impersonation even when the active user is a member
+    if is_impersonating() and lower in {
+        "back",
+        "unimpersonate",
+        "as me",
+        "stop as",
+        "stop impersonating",
+    }:
+        status, real = stop_impersonation()
+        at = format_handle((real or {}).get("ig_handle") or "admin")
+        append_assistant(f"Back as **{at}**. Type `help` for admin commands.")
+        return
+
     if lower in {"logout", "log out", "restart"}:
+        st.session_state.pop("admin_real_user", None)
         st.session_state.auth_state = NEED_IG
         st.session_state.user = None
         st.session_state.pending_handle = ""
@@ -9536,6 +9628,17 @@ def main() -> None:
             )
 
     bootstrap_greeting()
+    if (
+        st.session_state.get("auth_state") == LOGGED_IN
+        and st.session_state.get("user")
+        and is_impersonating()
+    ):
+        u = st.session_state.user
+        st.info(
+            f"Tasting as **@{u.get('ig_handle')}** "
+            f"(games visible: {'yes' if user_sees_games(u) else 'no'}). "
+            "Type `back` to return as admin."
+        )
     render_messages()
 
     if finish_pending_ig_scan():
