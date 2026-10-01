@@ -88,7 +88,9 @@ DEFAULT_GAME_LOCATION = "Happy Valley"
 DEFAULT_GAME_SPOTS = 4
 # Silent invite targeting (never shown to members)
 GAMES_VISIBLE_MIN = 40
+INVITE_ELIGIBLE_MIN = 15  # can still get soft invites when a game turns cold/urgent
 INVITE_PASS_THRESHOLD = 70
+INVITE_URGENT_THRESHOLD = 48  # lower bar when ≤3 days away or poorly filled
 INVITE_RAND_LOW = 0.8
 INVITE_RAND_HIGH = 1.2
 GITHUB_MEDIA_BASE = "https://raw.githubusercontent.com/vipvince/letsballs/main"
@@ -951,6 +953,15 @@ def _db_schema_ready() -> bool:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(game_id, ig_handle, eval_date)
             );
+
+            CREATE TABLE IF NOT EXISTS admin_dms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                to_handle TEXT NOT NULL,
+                from_handle TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                delivered INTEGER NOT NULL DEFAULT 0
+            );
             """,
         )
     seed_admin_user()
@@ -1576,9 +1587,12 @@ def format_admin_signup_notices(rows: list[dict]) -> str:
     for r in rows:
         when = r.get("when_text") or "a game"
         loc = r.get("location") or DEFAULT_GAME_LOCATION
+        handle = r.get("ig_handle") or "?"
+        ig_url = f"https://www.instagram.com/{normalize_handle(handle)}/"
         lines.append(
-            f"- @{r.get('ig_handle')} joined **#{r.get('game_id')}** "
-            f"{format_game_card(when, r.get('spots'), loc)}"
+            f"- @{handle} joined **#{r.get('game_id')}** "
+            f"{format_game_card(when, r.get('spots'), loc)}\n"
+            f"  Contact: [IG]({ig_url}) · `msg @{normalize_handle(handle)} hey — still good for this?`"
         )
     return "\n".join(lines)
 
@@ -1783,10 +1797,11 @@ def remove_signup_reply(status: str, handle: str, game: dict) -> str:
 def maybe_game_invite(reply: str = "", user: Optional[dict] = None) -> str:
     """
     Soft invite via daily lock + urgency-weighted random.
-    Final = (user_score × urgency) × rand(0.8, 1.2); pass if >= INVITE_PASS_THRESHOLD.
+    Final = (user_score × urgency) × rand(0.8, 1.2); pass if >= threshold.
+    Low scores (< Games UI floor) only roll when the game is already urgent/cold.
     """
     u = user or st.session_state.get("user")
-    if not u or not user_sees_games(u):
+    if not u or not user_can_be_invited(u):
         return ""
     handle = normalize_handle(u.get("ig_handle") or "")
     if not handle:
@@ -1799,6 +1814,9 @@ def maybe_game_invite(reply: str = "", user: Optional[dict] = None) -> str:
     if not games:
         return ""
     game = games[0]
+    # Below board visibility: only try when the game needs people
+    if not user_sees_games(u) and not game_is_invite_urgent(game):
+        return ""
     text = evaluate_game_invite(handle, game, user=u)
     return f"\n\n{text}" if text else ""
 
@@ -1934,7 +1952,11 @@ def evaluate_game_invite(
     if not handle or not game:
         return ""
     u = user or get_user_by_handle(handle) or {}
-    if not user_sees_games(u):
+    if not user_can_be_invited(u):
+        return ""
+    urgent = game_is_invite_urgent(game, now=now)
+    # Low-score members: only when cold/soon — they don't see the board day-to-day
+    if not user_sees_games(u) and not urgent:
         return ""
     # Already signed up — don't nag
     with get_conn() as conn:
@@ -1950,7 +1972,6 @@ def evaluate_game_invite(
 
     eval_date = _today_str(now=now)
     existing = _get_invite_eval_today(int(game["id"]), handle, eval_date)
-    urgent = game_is_invite_urgent(game, now=now)
 
     if existing:
         status = (existing.get("status") or "").upper()
@@ -1958,7 +1979,7 @@ def evaluate_game_invite(
             return ""  # already invited today
         if status == "SKIPPED_LOCK" and not urgent:
             return ""
-        # Urgent: force re-eval with boosted urgency / slightly lower bar
+        # Urgent: force re-eval with boosted urgency / lower bar
 
     score = invite_score_for_user(u)
     urgency = game_urgency_multiplier(game, now=now)
@@ -1966,9 +1987,9 @@ def evaluate_game_invite(
         urgency = min(2.0, max(urgency, 1.8))
     luck = random.uniform(INVITE_RAND_LOW, INVITE_RAND_HIGH)
     weight = float(score) * float(urgency) * luck
-    threshold = INVITE_PASS_THRESHOLD
-    if existing and urgent:
-        threshold = INVITE_PASS_THRESHOLD * 0.85
+    threshold = float(INVITE_PASS_THRESHOLD)
+    if urgent or (existing and urgent) or not user_sees_games(u):
+        threshold = float(INVITE_URGENT_THRESHOLD)
 
     if weight >= threshold:
         _save_invite_eval(
@@ -2079,7 +2100,119 @@ def join_next_game(ig_handle: str) -> tuple[str, dict]:
             (target["id"],),
         ).fetchone()
     _invalidate_games_cache()
-    return "ok", _as_dict(updated)
+    game_row = _as_dict(updated)
+    try:
+        notify_admins_of_join(handle, game_row)
+    except Exception:
+        pass
+    return "ok", game_row
+
+
+def admin_notify_email() -> str:
+    return (
+        _secret_or_env("ADMIN_NOTIFY_EMAIL")
+        or _secret_or_env("GMAIL_ADDRESS")
+        or _secret_or_env("GMAIL_USER")
+    )
+
+
+def gmail_smtp_creds() -> tuple[str, str]:
+    user = _secret_or_env("GMAIL_ADDRESS") or _secret_or_env("GMAIL_USER")
+    password = _secret_or_env("GMAIL_APP_PASSWORD")
+    return user, password
+
+
+def send_admin_email(subject: str, body: str) -> tuple[bool, str]:
+    """Send email to admin via Gmail SMTP (app password). Returns (ok, detail)."""
+    to_addr = admin_notify_email()
+    smtp_user, smtp_pass = gmail_smtp_creds()
+    if not to_addr:
+        return False, "Set ADMIN_NOTIFY_EMAIL (or GMAIL_ADDRESS) in secrets."
+    if not smtp_user or not smtp_pass:
+        return False, "Set GMAIL_ADDRESS + GMAIL_APP_PASSWORD in secrets."
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = smtp_user
+        msg["To"] = to_addr
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as smtp:
+            smtp.login(smtp_user, smtp_pass)
+            smtp.sendmail(smtp_user, [to_addr], msg.as_string())
+        return True, "sent"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def notify_admins_of_join(ig_handle: str, game: dict) -> None:
+    """In-app notice (admin_seen=0 already) + email to admin Gmail."""
+    handle = normalize_handle(ig_handle)
+    when = format_game_when_text((game or {}).get("when_text") or "") or "a game"
+    loc = (game or {}).get("location") or DEFAULT_GAME_LOCATION
+    gid = (game or {}).get("id")
+    ig_url = f"https://www.instagram.com/{handle}/"
+    subject = f"[playplaytennis] @{handle} joined #{gid}"
+    body = (
+        f"@{handle} joined game #{gid}\n"
+        f"{when} @ {loc}\n"
+        f"Spots left: {game.get('spots')}\n\n"
+        f"IG: {ig_url}\n"
+        f"In chat: msg @{handle} your note here\n"
+        f"Or DM them on Instagram."
+    )
+    send_admin_email(subject, body)
+
+
+def queue_admin_dm(to_handle: str, body: str, from_handle: str = "vip") -> tuple[str, Optional[dict]]:
+    """Queue a note the member sees next time they chat. Returns (status, user)."""
+    handle = normalize_handle(to_handle)
+    text = (body or "").strip()
+    if not handle or not text:
+        return "bad", None
+    user = get_user_by_handle(handle)
+    if not user:
+        return "missing", None
+    sender = normalize_handle(from_handle) or "vip"
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO admin_dms (to_handle, from_handle, body, delivered)
+            VALUES (?, ?, ?, 0)
+            """,
+            (handle, sender, text),
+        )
+    return "ok", user
+
+
+def consume_member_dms(ig_handle: str) -> str:
+    """Deliver undelivered admin notes to a member; mark delivered."""
+    handle = normalize_handle(ig_handle)
+    if not handle:
+        return ""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, from_handle, body, created_at
+            FROM admin_dms
+            WHERE lower(to_handle) = ? AND COALESCE(delivered, 0) = 0
+            ORDER BY id ASC
+            """,
+            (handle,),
+        ).fetchall()
+        if not rows:
+            return ""
+        ids = [int(_as_dict(r)["id"]) for r in rows]
+        conn.executemany(
+            "UPDATE admin_dms SET delivered = 1 WHERE id = ?",
+            [(i,) for i in ids],
+        )
+    lines = ["**Note from the club**"]
+    for r in rows:
+        d = _as_dict(r)
+        lines.append(d.get("body") or "")
+    return "\n\n".join(lines)
 
 
 def game_join_reply(status: str, game: dict) -> str:
@@ -2112,7 +2245,7 @@ def is_impersonating() -> bool:
 
 
 def admin_actor() -> Optional[dict]:
-    """The real admin account even while tasting a member chat."""
+    """The real admin account even while testing a member chat."""
     real = st.session_state.get("admin_real_user")
     if real:
         return real
@@ -2353,11 +2486,14 @@ def admin_help_text() -> str:
         "- `users` — member list with scores\n"
         "- `score @handle` / `score @handle 90` / `rescore @handle` — view, override, or recompute score\n"
         "- `assign @handle travel camel` — portrait (`animals` for the list)\n"
-        "- `add user @handle 4821` / `delete user @handle` / `reset pin @handle 4821`\n\n"
-        "**Taste their chat**\n"
+        "- `add user @handle 4821` / `delete user @handle` / `reset pin @handle 4821`\n"
+        "- `msg @handle your note` — drop a note in their chat (next time they open the app)\n\n"
+        "**Test their chat**\n"
         "- `as @handle` — impersonate (see games/invites as they do). Type `back` to return.\n\n"
         "**Other**\n"
-        "- `help` · `logout`"
+        "- `help` · `logout`\n"
+        "- Join alerts email → set `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` "
+        "(+ optional `ADMIN_NOTIFY_EMAIL`) in Streamlit secrets"
         f"{turso_note}"
     )
 
@@ -2372,7 +2508,7 @@ def try_admin_command(text: str) -> bool:
     if lower in {"animals", "/animals", "list animals", "avatars", "photos"}:
         append_assistant(animals_as_context())
         return True
-    # Impersonation exit — also reachable while tasting a member (see handle_logged_in)
+    # Impersonation exit — also reachable while testing a member (see handle_logged_in)
     if lower in {"back", "unimpersonate", "as me", "stop as", "stop impersonating"}:
         status, real = stop_impersonation()
         if status == "none":
@@ -2405,7 +2541,7 @@ def try_admin_command(text: str) -> bool:
             animal = (target or {}).get("mascot") or (target or {}).get("animal") or "player"
             emoji = (target or {}).get("animal_emoji") or "🎾"
             append_assistant(
-                f"Now chatting as **@{handle}** — **{animal}** {emoji}\n"
+                f"Now testing chat as **@{handle}** — **{animal}** {emoji}\n"
                 f"_(score {score}, games visible: {sees} — admin only)_\n\n"
                 "Talk like they would. Type `back` when you’re done."
             )
@@ -2651,6 +2787,29 @@ def try_admin_command(text: str) -> bool:
             append_assistant(
                 f"Rescored **@{handle}** from gender/age → **{invite_score_for_user(user)}**/100.\n\n"
                 f"{score_story_for_admin(user)}"
+            )
+        return True
+    dm_cmd = re.fullmatch(
+        r"(?:/)?(?:msg|dm|tell|note)\s+@?([A-Za-z0-9._]{2,30})\s+(.+)",
+        raw,
+        re.I | re.S,
+    )
+    if dm_cmd:
+        handle = normalize_handle(dm_cmd.group(1))
+        note = (dm_cmd.group(2) or "").strip()
+        actor = admin_actor() or st.session_state.get("user") or {}
+        status, target = queue_admin_dm(
+            handle, note, from_handle=(actor.get("ig_handle") or "vip")
+        )
+        if status == "bad":
+            append_assistant("Use `msg @handle your note here`.")
+        elif status == "missing":
+            append_assistant(f"No account for **@{handle}**.")
+        else:
+            ig_url = f"https://www.instagram.com/{handle}/"
+            append_assistant(
+                f"Queued a note for **@{handle}** — they’ll see it next time they chat.\n"
+                f"Also DM on IG if you want now: {ig_url}"
             )
         return True
     m = re.fullmatch(
@@ -6864,8 +7023,9 @@ def compute_invite_score(
         f"Invite score **{score}**/100 (admin only — never tell the member).\n"
         f"- Gender: {gender} → +{g_pts} ({g_why})\n"
         f"- Age: {age} → +{a_pts} ({a_why})\n"
-        f"- Games visible if score ≥ {GAMES_VISIBLE_MIN}; "
-        f"invite pass ≈ {INVITE_PASS_THRESHOLD} × urgency × luck."
+        f"- Games board if score ≥ {GAMES_VISIBLE_MIN}; "
+        f"soft invites from {INVITE_ELIGIBLE_MIN}+ when a game is cold/urgent "
+        f"(pass ≈ {INVITE_PASS_THRESHOLD}, urgent bar ≈ {INVITE_URGENT_THRESHOLD})."
     )
     return score, detail
 
@@ -6896,13 +7056,23 @@ def invite_score_for_user(user: Optional[dict]) -> int:
 
 
 def user_sees_games(user: Optional[dict] = None) -> bool:
-    """Whether Join / Games board / invites are offered. Chat is always open."""
+    """Whether Join / Games board are offered. Chat is always open."""
     u = user or st.session_state.get("user")
     if not u:
         return False
     if is_admin(u):
         return True
     return invite_score_for_user(u) >= GAMES_VISIBLE_MIN
+
+
+def user_can_be_invited(user: Optional[dict] = None) -> bool:
+    """Whether soft invites may fire (includes lower scores when games turn cold)."""
+    u = user or st.session_state.get("user")
+    if not u:
+        return False
+    if is_admin(u):
+        return True
+    return invite_score_for_user(u) >= INVITE_ELIGIBLE_MIN
 
 
 def score_story_for_admin(user: dict) -> str:
@@ -8895,7 +9065,7 @@ def render_mascot_banner(user: dict) -> None:
         if is_impersonating():
             real = st.session_state.get("admin_real_user") or {}
             real_at = format_handle(real.get("ig_handle") or "admin")
-            st.caption(f"@{handle} · tasting as member · `{real_at}` type `back`")
+            st.caption(f"@{handle} · testing as member · `{real_at}` type `back`")
         else:
             st.caption(f"@{handle}")
 
@@ -9330,9 +9500,12 @@ def handle_need_pin_signup(text: str) -> None:
     persist_login(user)
     animal = user.get("mascot") or user.get("animal") or "player"
     emoji = user.get("animal_emoji") or "🎾"
-    invite = maybe_game_invite(user=user) if user_sees_games(user) else ""
+    invite = maybe_game_invite(user=user) if user_can_be_invited(user) else ""
     notices = consume_admin_signup_notices() if is_admin(user) else ""
     notice_bit = f"\n\n{notices}" if notices else ""
+    dms = "" if is_admin(user) else consume_member_dms(user.get("ig_handle") or "")
+    if dms:
+        notice_bit = f"\n\n{dms}" + notice_bit
     append_assistant(
         f"You’re in, **{animal}** {emoji}\n\n"
         "Ask about games, spots, or courts. "
@@ -9376,16 +9549,19 @@ def handle_need_pin_login(text: str) -> None:
     persist_login(user)
     animal = user.get("mascot") or user.get("animal") or "player"
     emoji = user.get("animal_emoji") or "🎾"
-    invite = maybe_game_invite(user=user) if user_sees_games(user) else ""
+    invite = maybe_game_invite(user=user) if user_can_be_invited(user) else ""
     opener = (
         "What do you want to know about upcoming games?"
         if user_sees_games(user)
         else "Ask me anything tennis — racquets, weather, courts, vibes."
     )
+    dms = consume_member_dms(user.get("ig_handle") or "")
+    dm_bit = f"\n\n{dms}" if dms else ""
     append_assistant(
         f"Back on court, **{animal}** {emoji}\n\n"
         + opener
         + invite
+        + dm_bit
     )
 
 
@@ -9401,7 +9577,7 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     persist_login(fresh)
     animal = fresh.get("mascot") or fresh.get("animal") or "player"
     emoji = fresh.get("animal_emoji") or "🎾"
-    invite = maybe_game_invite(user=fresh) if user_sees_games(fresh) else ""
+    invite = maybe_game_invite(user=fresh) if user_can_be_invited(fresh) else ""
     notices = consume_admin_signup_notices() if is_admin(fresh) else ""
     notice_bit = f"\n\n{notices}" if notices else ""
     notice_bit += persistence_warning_for_admin() if is_admin(fresh) else ""
@@ -9433,8 +9609,17 @@ def handle_logged_in(text: str) -> None:
         append_assistant(f"Back as **{at}**. Type `help` for admin commands.")
         return
 
+    # Deliver queued admin notes once per session turn (members only)
+    if user and not is_admin(user) and not st.session_state.get("_dms_flushed"):
+        dms = consume_member_dms(user.get("ig_handle") or "")
+        if dms:
+            st.session_state["_dms_flushed"] = True
+            append_assistant(dms)
+            # continue into normal handling of their message
+
     if lower in {"logout", "log out", "restart"}:
         st.session_state.pop("admin_real_user", None)
+        st.session_state.pop("_dms_flushed", None)
         st.session_state.auth_state = NEED_IG
         st.session_state.user = None
         st.session_state.pending_handle = ""
@@ -9635,7 +9820,7 @@ def main() -> None:
     ):
         u = st.session_state.user
         st.info(
-            f"Tasting as **@{u.get('ig_handle')}** "
+            f"Testing chat as **@{u.get('ig_handle')}** "
             f"(games visible: {'yes' if user_sees_games(u) else 'no'}). "
             "Type `back` to return as admin."
         )
