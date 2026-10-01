@@ -2491,8 +2491,8 @@ def admin_help_text() -> str:
         "**Test their chat**\n"
         "- `as @handle` — impersonate (see games/invites as they do). Type `back` to return.\n\n"
         "**Other**\n"
-        "- `help` · `logout` · `test email` — send a Gmail SMTP probe to yourself\n"
-        "- Join alerts email → set `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` "
+        "- `help` · `logout`\n"
+        "- Join alerts email → `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` "
         "(+ optional `ADMIN_NOTIFY_EMAIL`) in Streamlit secrets"
         f"{turso_note}"
     )
@@ -2507,32 +2507,6 @@ def try_admin_command(text: str) -> bool:
         return True
     if lower in {"animals", "/animals", "list animals", "avatars", "photos"}:
         append_assistant(animals_as_context())
-        return True
-    if lower in {"test email", "test mail", "/test email", "email test"}:
-        to_addr = admin_notify_email()
-        smtp_user, smtp_pass = gmail_smtp_creds()
-        if not to_addr or not smtp_user or not smtp_pass:
-            missing = []
-            if not (smtp_user or to_addr):
-                missing.append("`GMAIL_ADDRESS` / `ADMIN_NOTIFY_EMAIL`")
-            if not smtp_pass:
-                missing.append("`GMAIL_APP_PASSWORD`")
-            append_assistant(
-                "Gmail secrets incomplete on this host. Add "
-                + ", ".join(missing)
-                + " in Streamlit secrets, reboot the app, then retry `test email`."
-            )
-            return True
-        ok, detail = send_admin_email(
-            "[playplaytennis] test email",
-            "Test from admin chat.\nIf you see this, join alerts will reach this inbox.",
-        )
-        if ok:
-            at = to_addr.find("@")
-            masked = (to_addr[:2] + "***" + to_addr[at:]) if at > 0 else "your inbox"
-            append_assistant(f"Test email sent to **{masked}**. Check Gmail (and spam).")
-        else:
-            append_assistant(f"Test email failed: `{detail}`")
         return True
     # Impersonation exit — also reachable while testing a member (see handle_logged_in)
     if lower in {"back", "unimpersonate", "as me", "stop as", "stop impersonating"}:
