@@ -1,0 +1,14 @@
+---
+description: Commit and push to origin/main to redeploy Streamlit Cloud whenever app work is ready
+alwaysApply: true
+---
+
+# Always deploy when ready
+
+When a feature, fix, or live-app change is complete:
+
+1. Commit the relevant files (skip secrets, `.env`, `*.db`, token dumps).
+2. Push to `origin main` immediately so Streamlit Community Cloud redeploys.
+3. Do not wait for a separate “push” or “redeploy” message.
+
+This repo deploys from GitHub `main`. A ready change is not finished until it is on `origin/main`.
