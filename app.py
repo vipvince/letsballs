@@ -261,8 +261,7 @@ AVATAR_POOL: list[dict[str, Any]] = [
     {"file": "dumpling_cat.png", "emoji": "🐱", "label": "dumpling cat", "tags": ["dumpling", "dimsum", "bao", "cat", "foodie", "港", "🐱", "🐈", "🦋"]},
     {"file": "crosscourt_cat.png", "emoji": "🐱", "label": "tennis cat", "tags": ["cat", "tennis", "🐈", "🐱", "🦋"]},
     {"file": "tennis_pug.png", "emoji": "🐶", "label": "tennis pug", "tags": ["dog", "pug", "puppy", "狗", "🐕"]},
-    {"file": "surf_dog.png", "emoji": "🐕", "label": "court shiba", "tags": ["shiba", "shiba inu", "dog", "puppy", "狗", "🐕", "vip"]},
-    {"file": "surf_dog.png", "emoji": "🐶", "label": "surf dog", "tags": ["surf", "beach", "dog", "sea", "ocean", "🏄"]},
+    {"file": "surf_dog.png", "emoji": "🏄", "label": "surfing dog", "tags": ["surf", "surfing", "beach", "dog", "sea", "ocean", "puppy", "狗", "🐕", "🐶", "🏄", "vip", "shiba", "golden", "retriever"]},
     {"file": "coffee_bear.png", "emoji": "🐻", "label": "coffee bear", "tags": ["coffee", "cafe", "咖啡", "latte", "bear"]},
     {"file": "chef_pig.png", "emoji": "🐷", "label": "chef pig", "tags": ["chef", "cook", "foodie", "kitchen", "recipe", "豬"]},
     {"file": "bakery_mouse.png", "emoji": "🐭", "label": "bakery mouse", "tags": ["bakery", "bread", "pastry", "croissant", "bake"]},
@@ -344,7 +343,8 @@ TENNIS_ANIMALS: dict[str, str] = {
     "Backhand Bunny": "🐰",
     "Forehand Frog": "🐸",
     "Matchpoint Meerkat": "🐿️",
-    "Court Shiba": "🐕",
+    "Surfing Dog": "🏄",
+    "Court Shiba": "🏄",  # legacy alias → surfing dog art
     "Spinny Squirrel": "🐿️",
     "Court Capybara": "🐹",
 }
@@ -359,7 +359,10 @@ ANIMAL_PHOTO_FILES.update({
     "Ace Axolotl": "ace_axolotl.png",
     "Crosscourt Cat": "crosscourt_cat.png",
     "Matchpoint Meerkat": "matchpoint_meerkat.png",
+    "Surfing Dog": "surf_dog.png",
+    "surfing dog": "surf_dog.png",
     "Court Shiba": "surf_dog.png",
+    "court shiba": "surf_dog.png",
     "Court Capybara": "court_capybara.png",
 })
 
@@ -1290,9 +1293,9 @@ def seed_admin_user() -> None:
     """Ensure @vip exists as admin with the club PIN. Renames the old vipstarbucks row."""
     handle = "vip"
     pin = "0413"
-    animal = "Court Shiba"
-    vibe = "Club captain energy — books the courts, then aces the banter."
-    emoji = TENNIS_ANIMALS.get(animal) or "🐕"
+    animal = "surfing dog"
+    vibe = "Club captain energy — books the courts, then catches the next wave."
+    emoji = "🏄"
     avatar_path = "surf_dog.png"
     pin_h = hash_pin(pin)
     with get_conn() as conn:
@@ -1319,12 +1322,25 @@ def seed_admin_user() -> None:
                     (handle,),
                 ).fetchone()
             )
+        # Rename legacy Court Shiba → surfing dog for vip (and any leftover label)
+        try:
+            conn.execute(
+                """
+                UPDATE users
+                SET animal = ?, mascot = ?, animal_emoji = ?, avatar_path = ?
+                WHERE lower(animal) IN ('court shiba', 'surf dog')
+                   OR lower(mascot) IN ('court shiba', 'surf dog')
+                """,
+                (animal, animal, emoji, avatar_path),
+            )
+        except Exception:
+            pass
         if row.get("id") is not None:
             # Skip write if already seeded — avoids Turso sync on every cold start.
             if (
                 row.get("pin_hash") == pin_h
-                and (row.get("animal") or "") == animal
-                and (row.get("mascot") or "") == animal
+                and (row.get("animal") or "").lower() == animal
+                and (row.get("mascot") or "").lower() == animal
                 and (row.get("avatar_path") or "") == avatar_path
             ):
                 return
@@ -3084,14 +3100,52 @@ def maybe_lucky_in(ig_handle: str, eligible: bool) -> bool:
     return random.random() < 0.25
 
 
-def character_reveal(name: str, emoji: str) -> str:
+def _persona_flair(scrape: Optional[dict[str, Any]] = None, reason: str = "") -> str:
+    """Short vibe tag for the reveal line (foodie KOL, traveler, …)."""
+    scrape = scrape or {}
+    fields = list(scrape.get("fields") or [])
+    bio = _field_value(fields, "biography:", "json.biography:").lower()
+    blob = f"{bio} {reason} {' '.join(scrape.get('emojis') or [])}".lower()
+    tags: list[str] = []
+    if any(w in blob for w in ("kol", "creator", "influencer", "youtuber", "blogger")):
+        tags.append("KOL")
+    if any(w in blob for w in ("food", "foodie", "cafe", "café", "sushi", "ramen", "dessert", "咖啡", "美食", "餐廳")):
+        tags.append("foodie")
+    if any(w in blob for w in ("travel", "trip", "wander", "旅", "✈️", "🌎", "🌏")):
+        tags.append("traveler")
+    if any(w in blob for w in ("tennis", "網球", "court", "racquet")):
+        tags.append("tennis buddy")
+    if any(w in blob for w in ("fitness", "yoga", "run", "gym", "sport")):
+        tags.append("active")
+    if any(w in blob for w in ("fashion", "beauty", "makeup", "style")):
+        tags.append("style")
+    if not tags and scrape.get("is_kol"):
+        tags.append("creator")
+    if not tags:
+        return "court legend in the making"
+    if len(tags) == 1:
+        return tags[0]
+    return f"{tags[0]} {tags[1]}"
+
+
+def character_reveal(
+    name: str,
+    emoji: str,
+    *,
+    handle: str = "",
+    scrape: Optional[dict[str, Any]] = None,
+    reason: str = "",
+) -> str:
     who = f"**{name}** {emoji}".strip()
+    flair = _persona_flair(scrape, reason)
+    at = f"@{normalize_handle(handle)}" if handle else "you"
     return random.choice(
         [
-            f"OMG. You got {who}.",
-            f"Wait — {who}?! That’s your character.",
-            f"Court just handed you {who}. Iconic.",
-            f"No way. You’re {who}.",
+            f"Congrats {at} — for our fellow **{flair}**, you just unlocked {who}. That’s iconic.",
+            f"YESSS {at}! Fellow **{flair}** energy detected → the court drafts you {who}. Wear it proud.",
+            f"Drumroll… for the **{flair}** of the group, {at} gets {who}. Absolute main-character moment.",
+            f"Congrats! Matching that **{flair}** vibe — you pulled {who}. Let’s gooo 🎾",
+            f"Plot twist for {at}: our fellow **{flair}** just rolled {who}. Chef’s kiss.",
         ]
     )
 
@@ -3421,8 +3475,15 @@ def try_admin_command(text: str) -> bool:
             label = (user or {}).get("mascot") or (user or {}).get("animal") or query
             emoji = (user or {}).get("animal_emoji") or ""
             photo = animal_photo_path(label, (user or {}).get("avatar_path"))
+            reveal = character_reveal(
+                label,
+                emoji,
+                handle=handle,
+                scrape={"fields": [], "assign_why": f"admin assign {label}"},
+                reason=label,
+            )
             append_assistant(
-                f"**@{handle}** is now **{label}** {emoji}.",
+                f"{reveal}\n\n**@{handle}** is locked in as **{label}** {emoji}.",
                 image=photo if isinstance(photo, str) and os.path.isfile(photo) else None,
             )
         return True
@@ -9168,50 +9229,76 @@ def focus_chat_input() -> None:
                   }}
                 }}
                 function bindFilm() {{
-                  const doc = window.parent.document;
-                  const poster = doc.querySelector(".lt-poster");
-                  const video = doc.querySelector(".lt-video") || doc.querySelector(".lt-film");
-                  const btn = doc.querySelector(".lt-sound");
-                  if (!btn || btn.dataset.bound === "1") return;
-                  btn.dataset.bound = "1";
-                  if (!video || video.tagName !== "VIDEO") return;
-                  video.loop = false;
-                  video.muted = false;
-                  function paint() {{
-                    const on = !video.muted && !video.paused;
-                    btn.setAttribute("aria-pressed", on ? "true" : "false");
-                    btn.textContent = on ? "Mute" : "Play";
-                    btn.setAttribute("aria-label", on ? "Mute sound" : "Play with sound");
+                  const docs = [];
+                  try {{ docs.push(window.parent.document); }} catch (e) {{}}
+                  try {{ docs.push(document); }} catch (e) {{}}
+                  let poster = null, video = null, btn = null, doc = null;
+                  for (let i = 0; i < docs.length; i++) {{
+                    const d = docs[i];
+                    if (!d || !d.querySelector) continue;
+                    const v = d.querySelector("video.lt-video");
+                    const b = d.querySelector(".lt-sound");
+                    if (v && b) {{ doc = d; video = v; btn = b; poster = d.querySelector(".lt-poster"); break; }}
                   }}
-                  function ensureSrc() {{
-                    const src = video.getAttribute("data-src") || "";
+                  if (!btn || !video || video.tagName !== "VIDEO") return;
+                  if (btn.dataset.bound === "1") {{
+                    // Still kick autoplay after Streamlit rerenders
+                    if (video.paused) {{
+                      video.muted = true;
+                      video.play().catch(function() {{}});
+                    }}
+                    return;
+                  }}
+                  btn.dataset.bound = "1";
+                  video.loop = true;
+                  video.muted = true;
+                  video.playsInline = true;
+                  function paint() {{
+                    const loud = !video.muted && !video.paused;
+                    btn.setAttribute("aria-pressed", loud ? "true" : "false");
+                    btn.textContent = loud ? "Mute" : "Sound";
+                    btn.setAttribute("aria-label", loud ? "Mute sound" : "Unmute");
+                  }}
+                  function ensurePlaying(withSound) {{
+                    const src = video.getAttribute("data-src") || video.getAttribute("src") || "";
                     if (src && !video.getAttribute("src")) {{
                       video.setAttribute("src", src);
                       video.load();
                     }}
-                    if (poster) poster.hidden = true;
+                    if (poster) poster.style.display = "none";
                     video.hidden = false;
+                    video.style.display = "block";
+                    if (withSound) video.muted = false;
+                    else video.muted = true;
+                    const p = video.play();
+                    if (p && p.catch) p.catch(function() {{}});
+                    paint();
                   }}
+                  video.addEventListener("playing", function() {{
+                    if (poster) poster.style.display = "none";
+                    paint();
+                  }});
                   video.addEventListener("ended", function() {{
-                    video.pause();
-                    const end = Math.max(0, (video.duration || 0) - 0.05);
-                    if (end) {{
-                      try {{ video.currentTime = end; }} catch (e) {{}}
-                    }}
                     paint();
                   }});
-                  btn.addEventListener("click", function() {{
-                    ensureSrc();
-                    if (video.paused) {{
-                      video.muted = false;
-                      video.play().catch(function() {{}});
-                    }} else {{
-                      video.muted = !video.muted;
-                      if (video.muted) video.pause();
+                  btn.addEventListener("click", function(ev) {{
+                    ev.preventDefault();
+                    if (video.paused || video.muted) ensurePlaying(true);
+                    else {{
+                      video.muted = true;
+                      paint();
                     }}
-                    paint();
                   }});
-                  paint();
+                  if (poster) {{
+                    poster.style.cursor = "pointer";
+                    poster.addEventListener("click", function() {{ ensurePlaying(true); }});
+                  }}
+                  video.addEventListener("click", function() {{
+                    if (video.muted) ensurePlaying(true);
+                    else {{ video.muted = true; paint(); }}
+                  }});
+                  // Start muted autoplay immediately
+                  ensurePlaying(false);
                 }}
                 let tries = 0;
                 const timer = setInterval(function() {{
@@ -9685,26 +9772,26 @@ def render_little_tennis_header() -> None:
         )
     poster = _hosted_media_url(os.path.join(STATIC_DIR, "poster.jpg"))
     film = _hosted_media_url(os.path.join(STATIC_DIR, "video.mp4"))
-    # Poster-only on first paint — video (2.7MB) loads only when Sound/Play is tapped.
-    poster_img = (
-        f'<img class="lt-film lt-poster" src="{poster}" alt="Animals on court" '
-        f'width="720" height="90" decoding="async" />'
-        if poster
-        else ""
-    )
-    video_tag = (
-        f'<video class="lt-film lt-video" playsinline preload="none" '
-        f'poster="{poster}" data-src="{film}" hidden></video>'
-        if film
-        else ""
-    )
+    # Prefer live video (muted autoplay). Poster only if the mp4 URL is missing.
+    if film:
+        media = (
+            f'<video class="lt-film lt-video" playsinline muted autoplay loop '
+            f'preload="auto" poster="{poster}" src="{film}" data-src="{film}"></video>'
+        )
+    elif poster:
+        media = (
+            f'<img class="lt-film lt-poster" src="{poster}" alt="Animals on court" '
+            f'width="720" height="90" decoding="async" />'
+        )
+    else:
+        media = ""
     st.markdown(
         '<header class="lt-head">'
         '<p class="lt-brand">www.playplaytennis.com</p>'
         '<p class="lt-tag">animals on court · let’s play</p>'
         '<div class="lt-stage">'
-        f"{poster_img}{video_tag}"
-        '<button type="button" class="lt-sound" aria-pressed="false" aria-label="Play with sound">Play</button>'
+        f"{media}"
+        '<button type="button" class="lt-sound" aria-pressed="false" aria-label="Unmute">Sound</button>'
         "</div>"
         f'<div class="lt-rail">{"".join(buttons)}</div>'
         "</header>",
@@ -9928,8 +10015,11 @@ def _begin_pin_signup(
     st.session_state.auth_state = NEED_PIN_SIGNUP
 
     photo_path = animal_photo_path(mascot, avatar_path)
+    why = ""
+    if isinstance(scrape, dict):
+        why = str(scrape.get("assign_why") or "")
     body = (
-        f"{character_reveal(mascot or display_name, emoji)}\n\n"
+        f"{character_reveal(mascot or display_name, emoji, handle=handle, scrape=scrape, reason=why)}\n\n"
         "Set a **4-digit PIN** to lock it in."
     )
     append_assistant(
@@ -10317,7 +10407,7 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     st.session_state.pending_handle = normalize_handle(user.get("ig_handle") or "")
     st.session_state.handle_locked = False
     st.session_state.locked_handle = ""
-    # Refresh from DB so seeded character (e.g. Court Shiba) shows immediately
+    # Refresh from DB so seeded character (e.g. surfing dog) shows immediately
     fresh = get_user_by_handle(user.get("ig_handle") or "") or user
     st.session_state.user = fresh
     persist_login(fresh)
