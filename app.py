@@ -500,7 +500,11 @@ BIO_AVATAR_HINTS: list[tuple[tuple[str, ...], str, str]] = [
 NEED_IG = "need_ig"
 NEED_PIN_SIGNUP = "need_pin_signup"
 NEED_PIN_LOGIN = "need_pin_login"
+NEED_LANG = "need_lang"
 LOGGED_IN = "logged_in"
+
+LANG_EN = "en"
+LANG_YUE = "yue"  # Cantonese
 
 
 def animal_photo_path(animal: Optional[str], avatar_path: Optional[str] = None) -> str:
@@ -532,6 +536,237 @@ def animal_photo_path(animal: Optional[str], avatar_path: Optional[str] = None) 
 
 def club_avatar() -> str:
     return CLUB_AVATAR if os.path.isfile(CLUB_AVATAR) else "🎾"
+
+
+def user_lang(user: Optional[dict] = None) -> str:
+    """Member chat language: en or yue. Game times stay English either way."""
+    u = user if user is not None else st.session_state.get("user")
+    if not u:
+        return LANG_EN
+    if is_admin(u) and not (u.get("lang") or "").strip():
+        return LANG_EN
+    raw = str(u.get("lang") or "").strip().lower()
+    if raw in {LANG_YUE, "zh", "zh-hk", "zh_hk", "zh-hant", "zh_hant", "cantonese", "中文", "粵", "粤", "繁體", "繁体"}:
+        return LANG_YUE
+    if raw in {LANG_EN, "english", "eng"}:
+        return LANG_EN
+    return LANG_EN
+
+
+def needs_lang_pick(user: Optional[dict]) -> bool:
+    if not user or is_admin(user):
+        return False
+    raw = user.get("lang")
+    return raw is None or str(raw).strip() == ""
+
+
+def set_user_lang(ig_handle: str, lang: str) -> Optional[dict]:
+    handle = normalize_handle(ig_handle)
+    code = LANG_YUE if lang == LANG_YUE else LANG_EN
+    if not handle:
+        return None
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET lang = ? WHERE lower(ig_handle) = ?",
+            (code, handle),
+        )
+    return get_user_by_handle(handle)
+
+
+def parse_lang_choice(text: str) -> Optional[str]:
+    """Parse an explicit language choice. Does not treat bare `lang` as English."""
+    raw = (text or "").strip().lower()
+    if not raw:
+        return None
+    # Strip command prefix if present
+    raw = re.sub(r"^(?:lang|language|語言|语言|/lang)\s*", "", raw, flags=re.I).strip()
+    if not raw:
+        return None
+    if re.search(
+        r"粵|粤|廣東|广东|cantonese|yue|\bzh\b|中文|chinese|繁體|繁体|traditional",
+        raw,
+        re.I,
+    ):
+        return LANG_YUE
+    if re.search(r"^(?:en|eng|english|英文)$", raw, re.I) or re.search(
+        r"\b(?:english|英文)\b", raw, re.I
+    ):
+        return LANG_EN
+    if raw in {"1", "e"}:
+        return LANG_EN
+    if raw in {"2", "c", "中", "繁"}:
+        return LANG_YUE
+    return None
+
+
+def is_lang_command(text: str) -> bool:
+    lower = (text or "").strip().lower()
+    return lower in {"lang", "language", "語言", "语言", "/lang"} or lower.startswith(
+        ("lang ", "language ", "/lang ")
+    )
+
+
+def lang_prompt_text() -> str:
+    return (
+        "Pick your chat language on the card below.\n\n"
+        "_(Game times stay in English either way, e.g. Oct 3 (Saturday) @ 6pm.)_"
+    )
+
+
+def apply_lang_choice(choice: str, *, from_card: bool = True) -> None:
+    """Persist language preference and continue into the member session."""
+    _ = from_card
+    user = st.session_state.get("user")
+    if not user:
+        st.session_state.auth_state = NEED_IG
+        append_assistant("Let’s start over — what’s your IG handle?")
+        return
+    code = LANG_YUE if choice == LANG_YUE else LANG_EN
+    updated = set_user_lang(user.get("ig_handle") or "", code) or user
+    st.session_state.user = updated
+    st.session_state.auth_state = LOGGED_IN
+    st.session_state.pop("_show_lang_card", None)
+    switch_only = bool(st.session_state.pop("_lang_switch_only", False))
+    signup = bool(st.session_state.pop("_lang_after_signup", False))
+    saved = t("lang_saved_yue" if code == LANG_YUE else "lang_saved_en", code)
+    if switch_only:
+        append_assistant(saved)
+        return
+    body, photo_path = _member_post_login_body(updated, signup=signup)
+    append_assistant(f"{saved}\n\n{body}", image=photo_path)
+
+
+def render_lang_pick_card() -> Optional[str]:
+    """Interactive card: English / 繁體中文. Returns chosen lang code or None."""
+    if st.session_state.get("auth_state") not in {NEED_LANG} and not st.session_state.get(
+        "_show_lang_card"
+    ):
+        return None
+    clicked: Optional[str] = None
+    nonce = int(st.session_state.get("_lang_card_nonce") or 0)
+    with st.container(border=True):
+        st.markdown("**Language · 語言**")
+        st.caption("English or Traditional Chinese · 英文或繁體中文")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("English", key=f"lang_pick_en_{nonce}", use_container_width=True):
+                clicked = LANG_EN
+        with c2:
+            if st.button("繁體中文", key=f"lang_pick_zh_{nonce}", use_container_width=True):
+                clicked = LANG_YUE
+        st.caption("Game times stay English · 比賽時間維持英文")
+    return clicked
+
+
+def t(key: str, lang: Optional[str] = None, **kwargs: Any) -> str:
+    """Member-facing copy. Game schedule strings stay English."""
+    code = lang or user_lang()
+    table = _COPY_YUE if code == LANG_YUE else _COPY_EN
+    template = table.get(key) or _COPY_EN.get(key) or key
+    try:
+        return template.format(**kwargs)
+    except Exception:
+        return template
+
+
+_COPY_EN: dict[str, str] = {
+    "tips": (
+        "**Quick tips**\n\n"
+        "- **Games** — see upcoming sessions when they appear for you\n"
+        "- **Join** — type `join` to pick a game, or `join #4` / `join Oct 10 11am`\n"
+        "- Ask about racquets, weather, courts — tennis talk is welcome\n"
+        "- Type `logout` to switch accounts\n"
+        "- Language: type `lang` to open the EN / 繁體中文 card"
+    ),
+    "no_board": "Nothing on your game board right now — tennis chat is still open.",
+    "no_join": (
+        "No open spots for you on the board right now — "
+        "ask about tennis gear, weather, or courts anytime."
+    ),
+    "join_none": "There is no game on the board right now.",
+    "join_full": "**{label}** @ {loc} is full.",
+    "join_already": (
+        "You’re already in for **{label}** @ {loc}.\n\n"
+        "For logistics (court, timing, who’s coming), {wa}."
+    ),
+    "join_ok": (
+        "You’re in for **{label}** @ {loc}.\n\n"
+        "Tap in for logistics — court updates and who’s coming:\n{wa}"
+    ),
+    "join_which": (
+        "想入邊場？\n\n"
+        "{options}\n\n"
+        "回覆例如 `join #4` 或 `join Oct 10 11am` — 或者撓下面 Join 握。"
+    ),
+    "persona_1": "Back on court, **{animal}** {emoji}",
+    "persona_2": "**{animal}** {emoji} is ready — let’s play.",
+    "persona_3": "Your court persona **{animal}** {emoji} is locked in.",
+    "persona_4": "Welcome back, **{animal}** {emoji}",
+    "opener_games": "What do you want to know about upcoming games?",
+    "opener_chat": "Ask me anything tennis — racquets, weather, courts, vibes.",
+    "signup_ok": "Ask about games, spots, or courts.",
+    "logged_out": "Logged out. Drop an IG handle when you’re ready.",
+    "reminder": (
+        "Reminder — you’re down for **#{gid} · {when}** @ {loc} tomorrow. "
+        "See you on court 🎾"
+    ),
+    "heads_up": "**Heads up**",
+    "invite_1": "By the way — spot open for **{label}** @ {loc}. Want in?",
+    "invite_2": "Quick one — **{label}** at {loc} still has space. Say yes and I’ll hold it.",
+    "invite_3": "Got a free spot for **{label}** @ {loc} — join?",
+    "invite_4": "Hey — **{label}** at {loc} still has room if you want in.",
+    "lang_saved_en": "Got it — chat in **English**. (Game times stay English.)",
+    "lang_saved_yue": "得，之後用**繁體中文**傾。比賽時間仍然用英文顯示。",
+    "lang_prompt_again": "Tap **English** or **繁體中文** on the card.",
+}
+
+_COPY_YUE: dict[str, str] = {
+    "tips": (
+        "**小提示**\n\n"
+        "- **Games** — 睇吓有咩場（有排期先會出現）\n"
+        "- **Join** — 打 `join` 揀場，或 `join #4` / `join Oct 10 11am`\n"
+        "- 球拍、天氣、球場都可以傾\n"
+        "- 打 `logout` 換帳號\n"
+        "- 語言：打 `lang` 打開 EN / 繁體中文 卡片"
+    ),
+    "no_board": "而家未有場俾你睇 — 不過網球相關都可以傾。",
+    "no_join": "而家未有開放名額 — 想傾球拍、天氣、球場都得。",
+    "join_none": "而家板上未有場。",
+    "join_full": "**{label}** @ {loc} 已經滿咗。",
+    "join_already": (
+        "你已經入咗 **{label}** @ {loc}。\n\n"
+        "場地／時間／邊個嚟：{wa}"
+    ),
+    "join_ok": (
+        "搞掂 — 你入咗 **{label}** @ {loc}。\n\n"
+        "物流同更新喺呢度：\n{wa}"
+    ),
+    "join_which": (
+        "想入邊場？\n\n"
+        "{options}\n\n"
+        "回覆例如 `join #4` 或 `join Oct 10 11am` — 或者撳下面 Join 掣。"
+    ),
+    "persona_1": "返場啦，**{animal}** {emoji}",
+    "persona_2": "**{animal}** {emoji} 已就位 — 開波啦。",
+    "persona_3": "你嘅球場角色 **{animal}** {emoji} 鎖定咗。",
+    "persona_4": "歡迎返嚟，**{animal}** {emoji}",
+    "opener_games": "想知吓最近有咩場？",
+    "opener_chat": "網球相關都可以問 — 球拍、天氣、球場、感覺。",
+    "signup_ok": "想問場次、名額定球場都可以。",
+    "logged_out": "已登出。準備好再丟 IG handle 畀我。",
+    "reminder": (
+        "提提你 — 你聽日有場 **#{gid} · {when}** @ {loc}。"
+        "球場見 🎾"
+    ),
+    "heads_up": "**提提你**",
+    "invite_1": "對了，順便問下 — **{label}** 有場 tennis（{loc}）有位，你得閒 join 嗎？",
+    "invite_2": "喔對了，**{label}** @ {loc} 仲有位，想唔想 join？",
+    "invite_3": "得閒嗎？**{label}** @ {loc} 仲有位，join 唔 join？",
+    "invite_4": "提提你 — **{label}** @ {loc} 有空位，想入就講聲。",
+    "lang_saved_en": "Got it — chat in **English**. (Game times stay English.)",
+    "lang_saved_yue": "得，之後用**繁體中文**傾。比賽時間仍然用英文顯示。",
+    "lang_prompt_again": "請撳下面卡片嘅 **English** 或 **繁體中文**。",
+}
 
 
 def completion_text(completion: Any) -> str:
@@ -584,9 +819,24 @@ def _is_streamlit_cloud() -> bool:
 
 
 def persistence_warning_for_admin() -> str:
-    """Streamlit Cloud wipes local SQLite on reboot unless Turso is configured."""
-    if using_durable_db():
+    """Warn when Cloud is not actually writing to Turso."""
+    url, token = turso_creds()
+    secrets_ok = bool(url and token)
+    shared = None
+    try:
+        shared = _turso_shared()
+    except Exception:
+        shared = None
+    connected = bool(shared and shared.get("conn") is not None)
+    if secrets_ok and connected:
         return ""
+    if secrets_ok and not connected:
+        return (
+            "\n\n⚠️ **Turso secrets are set but the app is NOT connected** "
+            "(likely missing `libsql` package). "
+            "Games/members may be writing to wiped local SQLite. "
+            "Redeploy after `libsql` is in requirements.txt, then type `db`."
+        )
     if not _is_streamlit_cloud():
         return ""
     return (
@@ -671,6 +921,16 @@ def _turso_shared() -> Optional[dict[str, Any]]:
     url, token = turso_creds()
     if not (url and token):
         return None
+    errors: list[str] = []
+    try:
+        import libsql  # noqa: F401
+    except Exception as exc:
+        # Without this package, secrets are ignored and Cloud uses wiped SQLite.
+        try:
+            st.session_state["_turso_connect_error"] = f"libsql import failed: {exc}"
+        except Exception:
+            pass
+        return None
     try:
         import libsql
         import tempfile
@@ -679,16 +939,16 @@ def _turso_shared() -> Optional[dict[str, Any]]:
         conn = libsql.connect(local, sync_url=url, auth_token=token)
         try:
             conn.sync()
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(f"embedded sync: {exc}")
         if hasattr(conn, "row_factory"):
             try:
                 conn.row_factory = _dict_row_factory
             except Exception:
                 pass
         return {"conn": conn, "mode": "embedded", "dirty": False, "last_sync": time.time()}
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(f"embedded: {exc}")
     try:
         import libsql
 
@@ -699,7 +959,12 @@ def _turso_shared() -> Optional[dict[str, Any]]:
             except Exception:
                 pass
         return {"conn": conn, "mode": "remote", "dirty": False, "last_sync": time.time()}
-    except Exception:
+    except Exception as exc:
+        errors.append(f"remote: {exc}")
+        try:
+            st.session_state["_turso_connect_error"] = " | ".join(errors)
+        except Exception:
+            pass
         return None
 
 
@@ -935,6 +1200,8 @@ def _db_schema_ready() -> bool:
             conn.execute("ALTER TABLE users ADD COLUMN invite_score INTEGER")
         if "invite_score_override" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN invite_score_override INTEGER")
+        if "lang" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN lang TEXT")
         signup_cols = _col_names(conn.execute("PRAGMA table_info(game_signups)").fetchall())
         if signup_cols and "admin_seen" not in signup_cols:
             conn.execute(
@@ -1637,7 +1904,7 @@ def games_board_markdown() -> str:
     games = list_games()
     if not games:
         return "No upcoming games on the board yet."
-    blocks = ["**Upcoming games**"]
+    blocks = ["**Upcoming games**", "_Join one game: `join #4` or `join Oct 10 11am`_"]
     for g in games:
         when = format_game_when_text((g.get("when_text") or "TBD").strip()) or "TBD"
         loc = (g.get("location") or DEFAULT_GAME_LOCATION).strip()
@@ -1646,21 +1913,21 @@ def games_board_markdown() -> str:
         except (TypeError, ValueError):
             spots = g.get("spots")
         spot_bit = f"{spots} spot left" if spots == 1 else f"{spots} spots left"
+        join_hint = ""
+        try:
+            if int(spots or 0) > 0:
+                join_hint = f"  \n→ `join #{g['id']}` · or `join {short_game_when(when, 28)}`"
+        except (TypeError, ValueError):
+            pass
         blocks.append(
             f"**#{g['id']}** · {when}  \n"
-            f"📍 {loc} · {spot_bit}"
+            f"📍 {loc} · {spot_bit}{join_hint}"
         )
     return "\n\n".join(blocks)
 
 
-def member_tips_text() -> str:
-    return (
-        "**Quick tips**\n\n"
-        "- **Games** — see upcoming sessions when they appear for you\n"
-        "- **Join** — grab the next open spot when a Join button shows\n"
-        "- Ask about racquets, weather, courts — tennis talk is welcome\n"
-        "- Type `logout` to switch accounts"
-    )
+def member_tips_text(user: Optional[dict] = None) -> str:
+    return t("tips", user_lang(user))
 
 
 def list_game_signups() -> list[dict]:
@@ -1967,19 +2234,14 @@ def _save_invite_eval(
             )
 
 
-def _natural_game_invite_copy(game: dict) -> str:
+def _natural_game_invite_copy(game: dict, lang: Optional[str] = None) -> str:
     when = format_game_when_text((game.get("when_text") or "").strip()) or "soon"
     loc = (game.get("location") or DEFAULT_GAME_LOCATION).strip()
     gid = game.get("id")
     label = f"#{gid} · {when}" if gid is not None else when
-    return random.choice(
-        [
-            f"對了，順便問下 — **{label}** 有場 tennis（{loc}）有位，你得閒 join 嗎？",
-            f"By the way — spot open for **{label}** @ {loc}. Want in?",
-            f"喔對了，**{label}** @ {loc} 仲有位，要不要 join？",
-            f"Quick one — **{label}** at {loc} still has space. Say yes and I’ll hold it.",
-        ]
-    )
+    code = lang or user_lang()
+    keys = ["invite_1", "invite_2", "invite_3", "invite_4"]
+    return t(random.choice(keys), code, label=label, loc=loc)
 
 
 def evaluate_game_invite(
@@ -2043,14 +2305,14 @@ def evaluate_game_invite(
         _save_invite_eval(
             int(game["id"]), handle, eval_date, "INVITED", weight, score, urgency
         )
-        return _natural_game_invite_copy(game)
+        return _natural_game_invite_copy(game, user_lang(u))
 
     # Cold + solid score: one more luck roll so fill rate recovers
     if cold and score >= GAMES_VISIBLE_MIN and random.random() < 0.45:
         _save_invite_eval(
             int(game["id"]), handle, eval_date, "INVITED", weight, score, urgency
         )
-        return _natural_game_invite_copy(game)
+        return _natural_game_invite_copy(game, user_lang(u))
 
     _save_invite_eval(
         int(game["id"]), handle, eval_date, "SKIPPED_LOCK", weight, score, urgency
@@ -2088,15 +2350,179 @@ def _confirms_game_join(text: str, last_assistant: str) -> bool:
     return bool(short_yes and asked)
 
 
+def resolve_join_game_id(
+    text: str,
+    games: Optional[list[dict]] = None,
+    *,
+    open_only: bool = True,
+) -> Optional[int]:
+    """
+    Pick one game from chat text: #id, then date/time/weekday cues.
+    Returns None when no cue matches (caller may fall back to soonest open).
+    """
+    live = list(games) if games is not None else list_games()
+    if open_only:
+        live = [g for g in live if int(g.get("spots") or 0) > 0]
+    if not live:
+        return None
+
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    m = re.search(r"#\s*(\d+)\b|(?:game|場)\s*#?\s*(\d+)\b", raw, re.I)
+    if m:
+        gid = int(m.group(1) or m.group(2))
+        if any(int(g.get("id") or 0) == gid for g in live):
+            return gid
+
+    now = datetime.now()
+    want_date = _resolve_game_date(raw, now=now)
+    want_time = _extract_game_time(raw)
+    want_weekday: Optional[int] = None
+    for token in re.findall(r"[A-Za-z]+|星期[一二三四五六日天]|週[一二三四五六日]", raw):
+        wd = _weekday_from_token(token)
+        if wd is not None:
+            want_weekday = wd
+            break
+
+    # Bare clock like "6pm" / "11am" with optional join words
+    if not want_date and not want_time and not want_weekday:
+        return None
+
+    scored: list[tuple[int, dict]] = []
+    for g in live:
+        gdt = game_when_datetime(g, now=now)
+        when = (g.get("when_text") or "").strip()
+        score = 0
+        if want_date and gdt and want_date.date() == gdt.date():
+            score += 12
+        elif want_date and when:
+            # month+day tokens in when_text
+            if want_date.strftime("%b").lower()[:3] in when.lower() and str(want_date.day) in when:
+                score += 10
+        if want_weekday is not None and gdt and gdt.weekday() == want_weekday:
+            score += 6
+        if want_time and gdt:
+            h, minute, _label = want_time
+            if gdt.hour == h and (minute == 0 or gdt.minute == minute):
+                score += 10
+            elif gdt.hour == h:
+                score += 6
+        elif want_time and when:
+            _h, _m, label = want_time
+            if label.lower() in when.lower().replace(" ", ""):
+                score += 8
+            elif re.search(rf"\b{_h}\s*(am|pm)\b", when, re.I):
+                score += 5
+        if score > 0:
+            scored.append((score, g))
+
+    if not scored:
+        return None
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            game_when_datetime(item[1], now=now) or datetime.max,
+            int(item[1].get("id") or 0),
+        )
+    )
+    return int(scored[0][1]["id"])
+
+
+def open_games_for_join() -> list[dict]:
+    return [g for g in list_games() if int(g.get("spots") or 0) > 0]
+
+
+def join_which_prompt(user: Optional[dict] = None) -> str:
+    """Ask which open game when bare join has more than one choice."""
+    open_games = open_games_for_join()
+    lines: list[str] = []
+    for g in open_games:
+        when = format_game_when_text((g.get("when_text") or "").strip()) or "TBD"
+        loc = (g.get("location") or DEFAULT_GAME_LOCATION).strip()
+        try:
+            spots = int(g.get("spots") or 0)
+        except (TypeError, ValueError):
+            spots = g.get("spots")
+        spot_bit = f"{spots} spot" if spots == 1 else f"{spots} spots"
+        lines.append(f"- **#{g['id']}** · {when} · {loc} · {spot_bit}")
+    options = "\n".join(lines) if lines else "- (none)"
+    return t("join_which", user_lang(user), options=options)
+
+
+def try_join_from_text(user: dict, text: str) -> bool:
+    """
+    Handle join intents. Returns True if the message was consumed.
+    Bare `join` with 2+ open games → ask which one (does not auto-pick).
+    """
+    if not user_sees_games(user):
+        append_assistant(t("no_join", user_lang(user)))
+        return True
+
+    open_games = open_games_for_join()
+    if not open_games:
+        append_assistant(t("join_none", user_lang(user)))
+        st.session_state.pop("_awaiting_join_pick", None)
+        return True
+
+    prefer = resolve_join_game_id(text, open_games)
+    awaiting = bool(st.session_state.get("_awaiting_join_pick"))
+    bare = bool(
+        re.fullmatch(
+            r"(join|join next|join game|sign up|signup|報名)[.!\s]*",
+            (text or "").strip(),
+            re.I,
+        )
+    )
+
+    # User is answering "which game?" or typed a specific cue
+    if prefer is not None:
+        st.session_state.pop("_awaiting_join_pick", None)
+        st.session_state["pending_invite_game_id"] = prefer
+        status, game = join_next_game(
+            user.get("ig_handle") or "",
+            preferred_game_id=prefer,
+            join_text=text,
+        )
+        append_assistant(game_join_reply(status, game, user))
+        return True
+
+    # Bare join / still awaiting a pick with no parseable cue
+    if bare or awaiting:
+        if len(open_games) == 1:
+            only = open_games[0]
+            gid = int(only["id"])
+            st.session_state.pop("_awaiting_join_pick", None)
+            st.session_state["pending_invite_game_id"] = gid
+            status, game = join_next_game(
+                user.get("ig_handle") or "",
+                preferred_game_id=gid,
+                join_text=text,
+            )
+            append_assistant(game_join_reply(status, game, user))
+            return True
+        st.session_state["_awaiting_join_pick"] = True
+        append_assistant(join_which_prompt(user))
+        return True
+
+    return False
+
+
 def join_next_game(
-    ig_handle: str, preferred_game_id: Optional[int] = None
+    ig_handle: str,
+    preferred_game_id: Optional[int] = None,
+    *,
+    join_text: str = "",
 ) -> tuple[str, dict]:
     """
-    Hold one spot. Prefer pending invite game when set.
-    Returns ('ok'|'already'|'full'|'none', game).
+    Hold one spot on a single game.
+    Preference order: preferred_game_id → cues in join_text → pending invite → soonest open.
     """
     handle = normalize_handle(ig_handle)
     prefer = preferred_game_id
+    if prefer is None and join_text:
+        prefer = resolve_join_game_id(join_text)
     if prefer is None:
         raw = st.session_state.get("pending_invite_game_id")
         try:
@@ -2131,6 +2557,11 @@ def join_next_game(
                 ),
                 None,
             )
+            if target is None:
+                # Preferred id exists but full / past — report that game if found
+                hit = next((g for g in live if int(g.get("id") or 0) == prefer), None)
+                if hit is not None and int(hit.get("spots") or 0) <= 0:
+                    return "full", hit
         if target is None:
             target = next((g for g in live if int(g.get("spots") or 0) > 0), None)
         if target is None:
@@ -2315,8 +2746,13 @@ def consume_day_before_reminders(ig_handle: str) -> str:
             when = format_game_when_text(game.get("when_text") or "") or "tomorrow"
             loc = game.get("location") or DEFAULT_GAME_LOCATION
             lines.append(
-                f"Reminder — you’re down for **#{game['id']} · {when}** @ {loc} tomorrow. "
-                f"See you on court 🎾"
+                t(
+                    "reminder",
+                    user_lang(get_user_by_handle(handle)),
+                    gid=game["id"],
+                    when=when,
+                    loc=loc,
+                )
             )
             try:
                 conn.execute(
@@ -2330,7 +2766,8 @@ def consume_day_before_reminders(ig_handle: str) -> str:
                 pass
     if not lines:
         return ""
-    return "**Heads up**\n\n" + "\n\n".join(lines)
+    head = t("heads_up", user_lang(get_user_by_handle(handle)))
+    return head + "\n\n" + "\n\n".join(lines)
 
 
 def member_inbox_bits(ig_handle: str) -> str:
@@ -2351,14 +2788,9 @@ def persona_line(user: dict) -> tuple[str, Optional[str]]:
     emoji = user.get("animal_emoji") or "🎾"
     photo = animal_photo_path(animal, user.get("avatar_path"))
     photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
-    line = random.choice(
-        [
-            f"Back on court, **{animal}** {emoji}",
-            f"**{animal}** {emoji} is ready — let’s play.",
-            f"Your court persona **{animal}** {emoji} is locked in.",
-            f"Welcome back, **{animal}** {emoji}",
-        ]
-    )
+    lang = user_lang(user)
+    key = random.choice(["persona_1", "persona_2", "persona_3", "persona_4"])
+    line = t(key, lang, animal=animal, emoji=emoji)
     return line, photo_path
 
 
@@ -2416,25 +2848,20 @@ def admin_today_markdown() -> str:
     return "\n".join(blocks)
 
 
-def game_join_reply(status: str, game: dict) -> str:
+def game_join_reply(status: str, game: dict, user: Optional[dict] = None) -> str:
     when = format_game_when_text((game or {}).get("when_text") or "") or "the next session"
     loc = (game or {}).get("location") or DEFAULT_GAME_LOCATION
     gid = (game or {}).get("id")
     label = f"#{gid} · {when}" if gid is not None else when
     wa = f"[Join the WhatsApp group]({WHATSAPP_GROUP_URL})"
+    lang = user_lang(user)
     if status == "none":
-        return "There is no game on the board right now."
+        return t("join_none", lang)
     if status == "full":
-        return f"**{label}** @ {loc} is full."
+        return t("join_full", lang, label=label, loc=loc)
     if status == "already":
-        return (
-            f"You’re already in for **{label}** @ {loc}.\n\n"
-            f"For logistics (court, timing, who’s coming), {wa}."
-        )
-    return (
-        f"You’re in for **{label}** @ {loc}.\n\n"
-        f"Tap in for logistics — court updates and who’s coming:\n{wa}"
-    )
+        return t("join_already", lang, label=label, loc=loc, wa=wa)
+    return t("join_ok", lang, label=label, loc=loc, wa=wa)
 
 
 def is_admin(user: Optional[dict]) -> bool:
@@ -2673,8 +3100,12 @@ def admin_help_text() -> str:
     turso_note = ""
     if not using_durable_db():
         turso_note = (
-            "\n\n_On Streamlit Cloud, add Turso secrets so deletes/signups survive reboots._"
+            "\n\n⚠️ **Data will vanish** when Streamlit Cloud sleeps/reboots unless you add "
+            "Turso secrets: `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` "
+            "(free at turso.tech). Type `db` to check."
         )
+    else:
+        turso_note = "\n\n_Durable DB (Turso) is on — games/members survive sleep._"
     return (
         "**Admin commands**\n\n"
         "**Games**\n"
@@ -2694,9 +3125,13 @@ def admin_help_text() -> str:
         "**Test their chat**\n"
         "- `as @handle` — impersonate (see games/invites as they do). Type `back` to return.\n\n"
         "**Other**\n"
+        "- `db` — storage status (local vs Turso)\n"
         "- `help` · `logout`\n"
         "- Join alerts email → `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` "
-        "(+ optional `ADMIN_NOTIFY_EMAIL`) in Streamlit secrets"
+        "(+ optional `ADMIN_NOTIFY_EMAIL`) in Streamlit secrets\n\n"
+        "**Cloud sleep:** Community Cloud hibernates after ~12h with no visits. "
+        "Wake via the button, or ping the app URL every few hours "
+        "(e.g. UptimeRobot / GitHub Action). Sleep itself is normal on the free tier."
         f"{turso_note}"
     )
 
@@ -2707,6 +3142,55 @@ def try_admin_command(text: str) -> bool:
     lower = raw.lower()
     if lower in {"help", "/help", "commands", "/commands"}:
         append_assistant(admin_help_text())
+        return True
+    if lower in {"db", "database", "storage", "/db"}:
+        url, token = turso_creds()
+        cloud = _is_streamlit_cloud()
+        shared = _turso_shared()
+        connected = bool(shared and shared.get("conn") is not None)
+        mode = (shared or {}).get("mode") or "—"
+        err = st.session_state.get("_turso_connect_error") or ""
+        host = ""
+        if url:
+            host = url.replace("libsql://", "").split("/")[0]
+        if using_durable_db() and connected:
+            with get_conn() as conn:
+                try:
+                    uc = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()
+                    gc = conn.execute("SELECT COUNT(*) AS c FROM games").fetchone()
+                    u_n = _as_dict(uc).get("c")
+                    g_n = _as_dict(gc).get("c")
+                    if u_n is None and isinstance(uc, (tuple, list)):
+                        u_n = uc[0]
+                    if g_n is None and isinstance(gc, (tuple, list)):
+                        g_n = gc[0]
+                except Exception:
+                    u_n, g_n = "?", "?"
+            append_assistant(
+                f"**Database:** Turso connected ✅\n"
+                f"- Host: `{host}`\n"
+                f"- Mode: `{mode}`\n"
+                f"- Users: **{u_n}** · Games: **{g_n}**\n"
+                f"- Cloud host: {'yes' if cloud else 'no (local)'}\n\n"
+                "Games and members survive sleep/reboot."
+            )
+        elif using_durable_db() and not connected:
+            append_assistant(
+                "**Database:** Turso secrets set, but NOT connected ⚠️\n"
+                f"- Host: `{host or '—'}`\n"
+                f"- Error: `{err or 'libsql missing or connect failed'}`\n\n"
+                "App is falling back to local SQLite (wiped on Cloud sleep).\n"
+                "Fix: ensure `libsql` is in `requirements.txt`, redeploy, then type `db` again."
+            )
+        else:
+            append_assistant(
+                "**Database:** local SQLite ⚠️\n"
+                f"- Cloud host: {'yes — data resets when the app sleeps/reboots' if cloud else 'no (local file)'}\n\n"
+                "Add Streamlit secrets:\n"
+                "- `TURSO_DATABASE_URL`\n"
+                "- `TURSO_AUTH_TOKEN`\n\n"
+                "Free Turso DB → https://turso.tech — then re-add games/members once."
+            )
         return True
     if lower in {"animals", "/animals", "list animals", "avatars", "photos"}:
         append_assistant(animals_as_context())
@@ -7549,8 +8033,9 @@ def format_api_error(exc: Exception) -> str:
     return f"API error ({type(exc).__name__}" + (f" {status}" if status else "") + f"): {short}"
 
 
-def local_tennis_reply(user_text: str) -> str:
+def local_tennis_reply(user_text: str, lang: Optional[str] = None) -> str:
     """Offline schedule answers when the API is unavailable."""
+    code = lang or user_lang()
     lower = (user_text or "").lower()
     games = list_games()
     off_topic = any(
@@ -7562,16 +8047,26 @@ def local_tennis_reply(user_text: str) -> str:
         )
     )
     if off_topic:
+        if code == LANG_YUE:
+            return "我哋呢度傾網球 — 場次、裝備、球場、天氣都得。想傾啲咩？"
         return (
-            "I’m here for tennis — club games, gear, courts, weather for play, the lot. "
-            "What’s on your mind court-side?"
+            "I'm here for tennis — club games, gear, courts, weather for play, the lot. "
+            "What's on your mind court-side?"
         )
     if not games:
+        if code == LANG_YUE:
+            return (
+                "而家未有排期場次。"
+                f"Admin 可以加場 — 例如 `Add game Sat 3pm 4 spots {DEFAULT_GAME_LOCATION}`。"
+            )
         return (
             "No games are scheduled yet. "
             f"An admin can add one in chat — e.g. `Add game Sat 3pm 4 spots {DEFAULT_GAME_LOCATION}`."
         )
-    return "Here's the current board:\n\n" + games_as_context()
+    board = games_as_context()
+    if code == LANG_YUE:
+        return "而家板上有呢啲場（時間用英文）：\n\n" + board
+    return "Here's the current board:\n\n" + board
 
 
 def scrub_future_game_promises(text: str) -> str:
@@ -7591,16 +8086,43 @@ def scrub_future_game_promises(text: str) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     if cleaned:
         return cleaned
+    code = user_lang()
     if list_games():
-        return "Ask me what’s on the board."
-    return "No games are scheduled right now."
+        return "想睇吓板上有咩場？" if code == LANG_YUE else "Ask me what’s on the board."
+    return "而家未有排期場次。" if code == LANG_YUE else "No games are scheduled right now."
 
 
-def deepseek_chat(messages: list[dict[str, str]], extra_system: str = "") -> str:
+def deepseek_chat(
+    messages: list[dict[str, str]],
+    extra_system: str = "",
+    *,
+    lang: Optional[str] = None,
+) -> str:
     client = get_client()
-    system = SYSTEM_PROMPT
+    code = lang or user_lang()
+    if code == LANG_YUE:
+        lang_block = (
+            "LANGUAGE (MANDATORY — highest priority):\n"
+            "- This member’s saved preference is Traditional Chinese (繁體中文).\n"
+            "- Reply entirely in Traditional Chinese, Hong Kong Cantonese written style.\n"
+            "- Do NOT use Simplified Chinese. Do NOT use Japanese.\n"
+            "- Even if the member writes in English (e.g. “good morning”), still reply in Traditional Chinese.\n"
+            "- Do NOT ask which language they want — preference is already saved.\n"
+            "- Keep club game dates/times/locations in English exactly as listed "
+            "(e.g. Oct 3 (Saturday) @ 6pm · Happy Valley)."
+        )
+    else:
+        lang_block = (
+            "LANGUAGE (MANDATORY — highest priority):\n"
+            "- This member’s saved preference is English.\n"
+            "- Reply in English only.\n"
+            "- Do NOT ask which language they want — preference is already saved.\n"
+            "- Keep club game dates/times in English as listed."
+        )
+
+    system = SYSTEM_PROMPT + "\n\n" + lang_block
     if extra_system:
-        system = SYSTEM_PROMPT + "\n\n" + extra_system
+        system = system + "\n\n" + extra_system + "\n\n" + lang_block
 
     last_user = ""
     for msg in reversed(messages):
@@ -7611,7 +8133,7 @@ def deepseek_chat(messages: list[dict[str, str]], extra_system: str = "") -> str
     if client is None:
         return (
             "DeepSeek API key missing — set `DEEPSEEK_API_KEY` in `.env` or Streamlit secrets.\n\n"
-            + local_tennis_reply(last_user)
+            + local_tennis_reply(last_user, lang=code)
         )
 
     api_messages = [{"role": "system", "content": system}] + messages
@@ -7622,10 +8144,12 @@ def deepseek_chat(messages: list[dict[str, str]], extra_system: str = "") -> str
             temperature=0.4,
             max_tokens=MAX_TOKENS,
         )
-        text = completion_text(completion) or "Serve again?"
+        text = completion_text(completion) or (
+            "有咩可以幫到你？" if code == LANG_YUE else "Serve again?"
+        )
         return scrub_future_game_promises(text)
     except Exception as exc:
-        return format_api_error(exc) + "\n\n" + local_tennis_reply(last_user)
+        return format_api_error(exc) + "\n\n" + local_tennis_reply(last_user, lang=code)
 
 def _month_from_token(token: str) -> Optional[int]:
     key = re.sub(r"[^a-z]", "", (token or "").lower())
@@ -8311,7 +8835,6 @@ def clear_login_cookie() -> None:
 def _apply_restored_user(user: dict) -> None:
     handle = normalize_handle(user.get("ig_handle") or "")
     st.session_state.user = user
-    st.session_state.auth_state = LOGGED_IN
     st.session_state.pending_handle = handle
     st.session_state.handle_locked = False
     st.session_state.locked_handle = ""
@@ -8320,6 +8843,17 @@ def _apply_restored_user(user: dict) -> None:
         content = str(msgs[0].get("content") or "")
         if "Drop your Instagram handle" in content:
             st.session_state.messages = []
+    if needs_lang_pick(user) and not is_admin(user):
+        st.session_state.auth_state = NEED_LANG
+        if not st.session_state.messages:
+            photo = animal_photo_path(
+                user.get("mascot") or user.get("animal"),
+                user.get("avatar_path"),
+            )
+            photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
+            append_assistant(lang_prompt_text(), image=photo_path)
+        return
+    st.session_state.auth_state = LOGGED_IN
     if not st.session_state.messages:
         line, photo_path = persona_line(user)
         inbox = member_inbox_bits(user.get("ig_handle") or "") if not is_admin(user) else ""
@@ -8334,7 +8868,7 @@ def _apply_restored_user(user: dict) -> None:
 
 def try_restore_login(cookie_map: Optional[dict] = None) -> bool:
     """Restore LOGGED_IN from HTTP cookie / CookieManager / query param."""
-    if st.session_state.get("auth_state") == LOGGED_IN and st.session_state.get("user"):
+    if st.session_state.get("auth_state") in {LOGGED_IN, NEED_LANG} and st.session_state.get("user"):
         return True
 
     cookie_map = cookie_map if cookie_map is not None else {}
@@ -8381,7 +8915,7 @@ def try_restore_login(cookie_map: Optional[dict] = None) -> bool:
 
 def assistant_avatar() -> str:
     """Robot before login; club tennis photo after login."""
-    if st.session_state.get("auth_state") == LOGGED_IN and st.session_state.get("user"):
+    if st.session_state.get("auth_state") in {LOGGED_IN, NEED_LANG} and st.session_state.get("user"):
         return club_avatar()
     return "🤖"
 
@@ -8918,6 +9452,20 @@ def inject_styles() -> None:
             color: #1c2822 !important;
           }
 
+          /* Language preference card */
+          div[data-testid="stVerticalBlockBorderWrapper"]:has(button[key="lang_pick_en"]),
+          div[data-testid="stVerticalBlockBorderWrapper"]:has(#lang_pick_en) {
+            background: rgba(255, 252, 248, 0.95) !important;
+            border-color: rgba(28, 40, 34, 0.12) !important;
+            border-radius: 16px !important;
+            box-shadow: 0 10px 28px rgba(26, 31, 28, 0.06) !important;
+          }
+          .stButton > button {
+            font-family: "Manrope", "Segoe UI", sans-serif !important;
+            font-weight: 600 !important;
+            border-radius: 12px !important;
+          }
+
           .lt-head {
             display: flex;
             flex-direction: column;
@@ -9181,30 +9729,47 @@ def run_quick_action(action: str) -> None:
         return
     key = (action or "").strip().lower()
     avatar = user_avatar(user)
+
+    join_gid: Optional[int] = None
     if key == "join":
+        join_gid = None  # soonest open
+    elif key.startswith("join_"):
+        try:
+            join_gid = int(key.split("_", 1)[1])
+        except (TypeError, ValueError):
+            return
+    else:
+        join_gid = None
+
+    if key == "join" or key.startswith("join_"):
         open_games = [g for g in list_games() if int(g.get("spots") or 0) > 0]
-        cold = [g for g in open_games if game_is_cold(g)]
-        open_g = cold[0] if cold else (open_games[0] if open_games else None)
+        if join_gid is not None:
+            open_g = next((g for g in open_games if int(g.get("id") or 0) == join_gid), None)
+        else:
+            cold = [g for g in open_games if game_is_cold(g)]
+            open_g = cold[0] if cold else (open_games[0] if open_games else None)
         when_bit = short_game_when((open_g or {}).get("when_text") or "")
         gid = (open_g or {}).get("id")
         join_label = f"Join #{gid} {when_bit}" if gid is not None else f"Join {when_bit}"
         append_user(join_label, avatar=avatar)
         if not user_sees_games(user):
-            append_assistant(
-                "No open spots for you on the board right now — "
-                "ask about tennis gear, weather, or courts anytime."
-            )
+            append_assistant(t("no_join", user_lang(user)))
             return
         prefer = int(gid) if gid is not None else None
         if prefer is not None:
             st.session_state["pending_invite_game_id"] = prefer
-        status, game = join_next_game(user.get("ig_handle") or "", preferred_game_id=prefer)
-        append_assistant(game_join_reply(status, game))
+        status, game = join_next_game(
+            user.get("ig_handle") or "",
+            preferred_game_id=prefer,
+            join_text=join_label,
+        )
+        st.session_state.pop("_awaiting_join_pick", None)
+        append_assistant(game_join_reply(status, game, user))
         return
     if key == "board":
         append_user("Games", avatar=avatar)
         if not user_sees_games(user):
-            append_assistant("Nothing on your game board right now — tennis chat is still open.")
+            append_assistant(t("no_board", user_lang(user)))
             return
         append_assistant(games_board_markdown())
         return
@@ -9213,7 +9778,7 @@ def run_quick_action(action: str) -> None:
         if is_admin(user):
             append_assistant(admin_help_text())
         else:
-            append_assistant(member_tips_text())
+            append_assistant(member_tips_text(user))
         return
 
 
@@ -9227,23 +9792,20 @@ def render_quick_actions() -> Optional[str]:
 
     upcoming = list_games() if user_sees_games(user) else []
     open_games = [g for g in upcoming if int(g.get("spots") or 0) > 0]
-    can_join = bool(open_games)
 
     labels: list[tuple[str, str]] = []
-    # Only offer Join / Games when score allows and something is scheduled
-    if can_join:
-        target = open_games[0]
-        cold = [g for g in open_games if game_is_cold(g)]
-        if cold:
-            target = cold[0]
-        when_bit = short_game_when(target.get("when_text") or "")
-        gid = target.get("id")
-        label = f"🎾 Join #{gid} {when_bit}" if gid is not None else f"🎾 Join {when_bit}"
-        labels.append(("join", label))
+    # One Join button per open game (max 3) so the right slot is obvious
+    for g in open_games[:3]:
+        when_bit = short_game_when(g.get("when_text") or "")
+        gid = g.get("id")
+        label = f"🎾 #{gid} {when_bit}" if gid is not None else f"🎾 {when_bit}"
+        labels.append((f"join_{gid}", label))
     if upcoming:
         labels.append(("board", "🎾 Games"))
     labels.append(("help" if is_admin(user) else "tips", "✨ Help" if is_admin(user) else "✨ Tips"))
 
+    if not labels:
+        return None
     cols = st.columns(len(labels))
     clicked = None
     for col, (key, label) in zip(cols, labels):
@@ -9328,7 +9890,7 @@ def guest_tennis_story_reply(user_text: str = "", remind_ig: bool = True) -> str
 def bootstrap_greeting() -> None:
     if st.session_state.messages:
         return
-    if st.session_state.get("auth_state") == LOGGED_IN and st.session_state.get("user"):
+    if st.session_state.get("auth_state") in {LOGGED_IN, NEED_LANG} and st.session_state.get("user"):
         return
     append_assistant(
         "Hey — welcome to www.playplaytennis.com.\n\n"
@@ -9715,29 +10277,10 @@ def handle_need_pin_signup(text: str) -> None:
         return
 
     rewrite_last_user("****")
-    st.session_state.user = user
-    st.session_state.auth_state = LOGGED_IN
-    persist_login(user)
-    line, photo_path = persona_line(user)
-    invite = maybe_game_invite(user=user) if user_can_be_invited(user) else ""
-    notices = consume_admin_signup_notices() if is_admin(user) else ""
-    notice_bit = f"\n\n{notices}" if notices else ""
-    inbox = "" if is_admin(user) else member_inbox_bits(user.get("ig_handle") or "")
-    if inbox:
-        notice_bit = f"\n\n{inbox}" + notice_bit
-        st.session_state["_dms_flushed"] = True
-    append_assistant(
-        f"{line}\n\n"
-        "Ask about games, spots, or courts. "
-        + (
-            "Type `help` for admin commands."
-            if is_admin(user)
-            else ""
-        )
-        + invite
-        + notice_bit,
-        image=photo_path,
-    )
+    if is_admin(user):
+        complete_admin_login(user)
+        return
+    start_member_session(user, signup=True)
 
 
 def handle_need_pin_login(text: str) -> None:
@@ -9765,27 +10308,7 @@ def handle_need_pin_login(text: str) -> None:
     if is_admin(user):
         complete_admin_login(user)
         return
-    st.session_state.user = user
-    st.session_state.auth_state = LOGGED_IN
-    persist_login(user)
-    line, photo_path = persona_line(user)
-    invite = maybe_game_invite(user=user) if user_can_be_invited(user) else ""
-    opener = (
-        "What do you want to know about upcoming games?"
-        if user_sees_games(user)
-        else "Ask me anything tennis — racquets, weather, courts, vibes."
-    )
-    inbox = member_inbox_bits(user.get("ig_handle") or "")
-    dm_bit = f"\n\n{inbox}" if inbox else ""
-    if inbox:
-        st.session_state["_dms_flushed"] = True
-    append_assistant(
-        f"{line}\n\n"
-        + opener
-        + invite
-        + dm_bit,
-        image=photo_path,
-    )
+    start_member_session(user, signup=False)
 
 
 def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
@@ -9812,7 +10335,62 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     )
 
 
+def _member_post_login_body(user: dict, *, signup: bool = False) -> tuple[str, Optional[str]]:
+    """Welcome body + optional persona photo after language is known."""
+    line, photo_path = persona_line(user)
+    invite = maybe_game_invite(user=user) if user_can_be_invited(user) else ""
+    inbox = member_inbox_bits(user.get("ig_handle") or "")
+    dm_bit = f"\n\n{inbox}" if inbox else ""
+    if inbox:
+        st.session_state["_dms_flushed"] = True
+    lang = user_lang(user)
+    if signup:
+        opener = t("signup_ok", lang)
+    elif user_sees_games(user):
+        opener = t("opener_games", lang)
+    else:
+        opener = t("opener_chat", lang)
+    return f"{line}\n\n{opener}{invite}{dm_bit}", photo_path
+
+
+def start_member_session(user: dict, *, signup: bool = False) -> None:
+    """After PIN: ask language once, else land in chat."""
+    fresh = get_user_by_handle(user.get("ig_handle") or "") or user
+    st.session_state.user = fresh
+    st.session_state.pending_handle = normalize_handle(fresh.get("ig_handle") or "")
+    st.session_state.handle_locked = False
+    st.session_state.locked_handle = ""
+    persist_login(fresh)
+    if needs_lang_pick(fresh):
+        st.session_state.auth_state = NEED_LANG
+        st.session_state["_lang_after_signup"] = bool(signup)
+        photo = animal_photo_path(
+            fresh.get("mascot") or fresh.get("animal"),
+            fresh.get("avatar_path"),
+        )
+        photo_path = photo if isinstance(photo, str) and os.path.isfile(photo) else None
+        append_assistant(lang_prompt_text(), image=photo_path)
+        return
+    st.session_state.auth_state = LOGGED_IN
+    body, photo_path = _member_post_login_body(fresh, signup=signup)
+    append_assistant(body, image=photo_path)
+
+
+def handle_need_lang(text: str) -> None:
+    choice = parse_lang_choice(text)
+    if not choice:
+        append_assistant("Tap **English** or **繁體中文** on the card below.")
+        return
+    apply_lang_choice(choice, from_card=False)
+
+
 def handle_logged_in(text: str) -> None:
+    # Always reload so lang / score edits stick
+    handle = normalize_handle((st.session_state.user or {}).get("ig_handle") or "")
+    if handle:
+        fresh = get_user_by_handle(handle)
+        if fresh:
+            st.session_state.user = fresh
     user = st.session_state.user
     lower = text.strip().lower()
 
@@ -9839,36 +10417,59 @@ def handle_logged_in(text: str) -> None:
     if lower in {"logout", "log out", "restart"}:
         st.session_state.pop("admin_real_user", None)
         st.session_state.pop("_dms_flushed", None)
+        st.session_state.pop("_show_lang_card", None)
+        st.session_state.pop("_awaiting_join_pick", None)
         st.session_state.auth_state = NEED_IG
         st.session_state.user = None
         st.session_state.pending_handle = ""
         st.session_state.handle_locked = False
         st.session_state.locked_handle = ""
         clear_login_cookie()
-        append_assistant("Logged out. Drop an IG handle when you’re ready.")
+        append_assistant(t("logged_out", user_lang(user)))
         return
+
+    if is_lang_command(text):
+        choice = parse_lang_choice(text)
+        if choice:
+            st.session_state["_lang_switch_only"] = True
+            apply_lang_choice(choice, from_card=False)
+            return
+        st.session_state["_show_lang_card"] = True
+        st.session_state["_lang_switch_only"] = True
+        st.session_state["_lang_card_nonce"] = int(st.session_state.get("_lang_card_nonce") or 0) + 1
+        append_assistant("Pick **English** or **繁體中文** on the card below.")
+        return
+
+    # If the bot asked language in chat, accept a direct pick and save it
+    last_bot = _last_assistant_text()
+    if re.search(r"language|語言|中文|english or", last_bot or "", re.I):
+        choice = parse_lang_choice(text)
+        if choice and not is_lang_command(text):
+            st.session_state["_lang_switch_only"] = True
+            apply_lang_choice(choice, from_card=False)
+            return
 
     if lower in {"today", "dash", "dashboard", "/today", "ops"} and is_admin(user):
         append_assistant(admin_today_markdown())
         return
     if lower in {"board", "games", "/games", "list games", "upcoming", "upcoming games"}:
         if not user_sees_games(user) and not is_admin(user):
-            append_assistant("Nothing on your game board right now — tennis chat is still open.")
+            append_assistant(t("no_board", user_lang(user)))
             return
         append_assistant(games_board_markdown())
         return
-    if lower in {"join", "join next", "join game", "sign up", "signup"}:
-        if not user_sees_games(user):
-            append_assistant(
-                "No open spots for you on the board right now — "
-                "ask about tennis gear, weather, or courts anytime."
-            )
-            return
-        status, game = join_next_game(user.get("ig_handle") or "")
-        append_assistant(game_join_reply(status, game))
+    if lower in {"join", "join next", "join game", "sign up", "signup"} or re.match(
+        r"^(join|報名)\b", lower
+    ):
+        try_join_from_text(user, text)
+        return
+
+    # After we asked "which game?", accept #id / date-time without requiring "join"
+    if st.session_state.get("_awaiting_join_pick") and resolve_join_game_id(text):
+        try_join_from_text(user, text)
         return
     if lower in {"tips"} or (lower in {"help", "/help"} and not is_admin(user)):
-        append_assistant(member_tips_text())
+        append_assistant(member_tips_text(user))
         return
 
     # Admin commands: help, games, score, add game
@@ -9899,8 +10500,27 @@ def handle_logged_in(text: str) -> None:
             return
 
     if user_sees_games(user) and not is_admin(user) and _confirms_game_join(text, _last_assistant_text()):
-        status, game = join_next_game(user.get("ig_handle") or "")
-        append_assistant(game_join_reply(status, game))
+        prefer = resolve_join_game_id(text) or resolve_join_game_id(_last_assistant_text())
+        # "yes" to an invite → use pending invite id; don't ask which game
+        if prefer is None:
+            raw = st.session_state.get("pending_invite_game_id")
+            try:
+                prefer = int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                prefer = None
+        if prefer is None and len(open_games_for_join()) > 1:
+            st.session_state["_awaiting_join_pick"] = True
+            append_assistant(join_which_prompt(user))
+            return
+        if prefer is not None:
+            st.session_state["pending_invite_game_id"] = prefer
+        st.session_state.pop("_awaiting_join_pick", None)
+        status, game = join_next_game(
+            user.get("ig_handle") or "",
+            preferred_game_id=prefer,
+            join_text=text,
+        )
+        append_assistant(game_join_reply(status, game, user))
         return
 
     games = list_games() if user_sees_games(user) or is_admin(user) else []
@@ -9917,13 +10537,27 @@ def handle_logged_in(text: str) -> None:
             "Talk tennis generally (gear, weather, courts, vibes). "
             "Do not offer to flag, notify, or watch for a future post."
         )
+    lang = user_lang(user)
+    lang_rule = (
+        "LANGUAGE already set — do not ask again. "
+        "Reply in Traditional Chinese (繁體) even if the user wrote English. "
+        "Game times stay English."
+        if lang == LANG_YUE
+        else (
+            "LANGUAGE already set — do not ask again. Reply in English. "
+            "Game times stay English."
+        )
+    )
     extra = (
-        f"Member: @{user.get('ig_handle')} · mascot {user.get('animal')}.\n"
+        f"Member: @{user.get('ig_handle')} · mascot {user.get('animal')} · "
+        f"chat_lang={'zh-Hant' if lang == LANG_YUE else 'en'}.\n"
         + (f"{games_as_context()}\n" if games else "No scheduled games are visible to this member.\n")
         + f"{game_rule}\n"
+        + f"{lang_rule}\n"
         "Trust only the live Scheduled games block above for what exists. "
         "Never invent games, signups, or members from earlier chat messages. "
-        "Never mention invite scores, gates, eligibility, or targeting."
+        "Never mention invite scores, gates, eligibility, or targeting. "
+        "Never ask the member to choose a language."
     )
     if is_admin(user):
         extra += (
@@ -9939,7 +10573,7 @@ def handle_logged_in(text: str) -> None:
     history.append({"role": "user", "content": text})
 
     with st.spinner("Thinking…"):
-        reply = deepseek_chat(history, extra_system=extra)
+        reply = deepseek_chat(history, extra_system=extra, lang=lang)
     append_assistant(reply + maybe_game_invite(reply, user=user))
 
 
@@ -9949,10 +10583,10 @@ def process_user_input(text: str) -> None:
         return
 
     state = st.session_state.auth_state
-    avatar = user_avatar() if state == LOGGED_IN else "👤"
+    avatar = user_avatar() if state in {LOGGED_IN, NEED_LANG} else "👤"
 
     # Admin one-line login: @vip 0413
-    if state in {NEED_IG, NEED_PIN_LOGIN, NEED_PIN_SIGNUP}:
+    if state in {NEED_IG, NEED_PIN_LOGIN, NEED_PIN_SIGNUP, NEED_LANG}:
         quick = parse_admin_quick_login(text)
         if quick:
             handle, pin = quick
@@ -9973,6 +10607,8 @@ def process_user_input(text: str) -> None:
         handle_need_pin_signup(text)
     elif state == NEED_PIN_LOGIN:
         handle_need_pin_login(text)
+    elif state == NEED_LANG:
+        handle_need_lang(text)
     elif state == LOGGED_IN:
         handle_logged_in(text)
     else:
@@ -9988,6 +10624,7 @@ def placeholder_for_state() -> str:
         NEED_IG: "@your_instagram_handle…",
         NEED_PIN_SIGNUP: "Choose a 4-digit PIN…",
         NEED_PIN_LOGIN: "Your 4-digit PIN…",
+        NEED_LANG: "EN or 粵 / 中文…",
         LOGGED_IN: (
             "help"
             if is_admin(st.session_state.user)
@@ -10049,6 +10686,16 @@ def main() -> None:
 
     if finish_pending_ig_scan():
         st.rerun()
+
+    lang_choice = render_lang_pick_card()
+    if lang_choice:
+        apply_lang_choice(lang_choice, from_card=True)
+        st.rerun()
+
+    # During language pick (first login or `lang` command), show card and pause chat send
+    if st.session_state.get("auth_state") == NEED_LANG or st.session_state.get("_show_lang_card"):
+        focus_chat_input()
+        return
 
     quick = render_quick_actions()
     if quick:

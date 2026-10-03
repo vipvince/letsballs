@@ -1,0 +1,25 @@
+# Optional: ping the Streamlit app so Community Cloud is less likely to sleep.
+# Setup:
+#   1. Repo → Settings → Secrets → Actions
+#   2. Add STREAMLIT_APP_URL = https://YOUR_APP.streamlit.app
+# Sleep (~12h idle) is a free-tier limit — this only helps if the ping counts as traffic.
+name: Keep Streamlit awake
+
+on:
+  schedule:
+    - cron: "0 */8 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping app URL
+        env:
+          APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "Set repo secret STREAMLIT_APP_URL to your https://….streamlit.app URL"
+            exit 0
+          fi
+          curl -fsSL -A "letsballs-keepawake" -o /dev/null -w "%{http_code}\n" "$APP_URL" || true
