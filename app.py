@@ -9228,83 +9228,10 @@ def focus_chat_input() -> None:
                     scroller.addEventListener("scroll", hidePop);
                   }}
                 }}
-                function bindFilm() {{
-                  const docs = [];
-                  try {{ docs.push(window.parent.document); }} catch (e) {{}}
-                  try {{ docs.push(document); }} catch (e) {{}}
-                  let poster = null, video = null, btn = null, doc = null;
-                  for (let i = 0; i < docs.length; i++) {{
-                    const d = docs[i];
-                    if (!d || !d.querySelector) continue;
-                    const v = d.querySelector("video.lt-video");
-                    const b = d.querySelector(".lt-sound");
-                    if (v && b) {{ doc = d; video = v; btn = b; poster = d.querySelector(".lt-poster"); break; }}
-                  }}
-                  if (!btn || !video || video.tagName !== "VIDEO") return;
-                  if (btn.dataset.bound === "1") {{
-                    // Still kick autoplay after Streamlit rerenders
-                    if (video.paused) {{
-                      video.muted = true;
-                      video.play().catch(function() {{}});
-                    }}
-                    return;
-                  }}
-                  btn.dataset.bound = "1";
-                  video.loop = true;
-                  video.muted = true;
-                  video.playsInline = true;
-                  function paint() {{
-                    const loud = !video.muted && !video.paused;
-                    btn.setAttribute("aria-pressed", loud ? "true" : "false");
-                    btn.textContent = loud ? "Mute" : "Sound";
-                    btn.setAttribute("aria-label", loud ? "Mute sound" : "Unmute");
-                  }}
-                  function ensurePlaying(withSound) {{
-                    const src = video.getAttribute("data-src") || video.getAttribute("src") || "";
-                    if (src && !video.getAttribute("src")) {{
-                      video.setAttribute("src", src);
-                      video.load();
-                    }}
-                    if (poster) poster.style.display = "none";
-                    video.hidden = false;
-                    video.style.display = "block";
-                    if (withSound) video.muted = false;
-                    else video.muted = true;
-                    const p = video.play();
-                    if (p && p.catch) p.catch(function() {{}});
-                    paint();
-                  }}
-                  video.addEventListener("playing", function() {{
-                    if (poster) poster.style.display = "none";
-                    paint();
-                  }});
-                  video.addEventListener("ended", function() {{
-                    paint();
-                  }});
-                  btn.addEventListener("click", function(ev) {{
-                    ev.preventDefault();
-                    if (video.paused || video.muted) ensurePlaying(true);
-                    else {{
-                      video.muted = true;
-                      paint();
-                    }}
-                  }});
-                  if (poster) {{
-                    poster.style.cursor = "pointer";
-                    poster.addEventListener("click", function() {{ ensurePlaying(true); }});
-                  }}
-                  video.addEventListener("click", function() {{
-                    if (video.muted) ensurePlaying(true);
-                    else {{ video.muted = true; paint(); }}
-                  }});
-                  // Start muted autoplay immediately
-                  ensurePlaying(false);
-                }}
                 let tries = 0;
                 const timer = setInterval(function() {{
                   tries += 1;
                   bindCritters();
-                  bindFilm();
                   if ((focusChat() && docHasCritters()) || tries > 24) clearInterval(timer);
                 }}, 50);
                 function docHasCritters() {{
@@ -9579,6 +9506,13 @@ def inject_styles() -> None:
             line-height: 1.2;
           }
           .lt-stage { position: relative; }
+          iframe[title="st.iframe"] {
+            border: 0 !important;
+          }
+          [data-testid="stIFrame"] iframe,
+          [data-testid="stCustomComponentV1"] iframe {
+            border: 0 !important;
+          }
           .lt-film,
           .lt-poster,
           .lt-video {
@@ -9755,6 +9689,105 @@ def choose_rail_avatars() -> list[str]:
     return pick
 
 
+def render_header_film() -> None:
+    """Paused-by-default court film. Play starts video + sound; Mute/Sound toggles audio.
+
+    Lives in components.html so the button is a real click target (Streamlit
+    markdown strips <button> and parent-iframe JS never receives the click).
+    """
+    poster = _hosted_media_url(os.path.join(STATIC_DIR, "poster.jpg"))
+    film = _hosted_media_url(os.path.join(STATIC_DIR, "video.mp4"))
+    if not film and not poster:
+        return
+    try:
+        import streamlit.components.v1 as components
+    except Exception:
+        return
+    poster_js = json.dumps(poster or "")
+    film_js = json.dumps(film or "")
+    components.html(
+        f"""
+        <div class="stage">
+          <video id="ltv" class="film" playsinline preload="metadata"
+            poster={poster_js} src={film_js} muted></video>
+          <button type="button" id="ltb" class="ctl">Play</button>
+        </div>
+        <style>
+          html, body {{ margin: 0; padding: 0; overflow: hidden; background: transparent; }}
+          .stage {{ position: relative; width: 100%; height: 90px; }}
+          .film {{
+            width: 100%; height: 90px; object-fit: cover; object-position: center 42%;
+            border-radius: 14px; display: block; background: #1c2822;
+          }}
+          .ctl {{
+            position: absolute; right: 8px; bottom: 8px; z-index: 3;
+            border: 0; border-radius: 999px; padding: 6px 12px;
+            background: rgba(247, 244, 239, 0.96); color: #1c2822;
+            font-family: Manrope, Segoe UI, sans-serif; font-size: 11px;
+            font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+            cursor: pointer; pointer-events: auto;
+          }}
+          .ctl.on {{ background: #3d5c4a; color: #f7f4ef; }}
+        </style>
+        <script>
+          (function() {{
+            const v = document.getElementById("ltv");
+            const b = document.getElementById("ltb");
+            if (!v || !b) return;
+            v.loop = true;
+            v.muted = true;
+            v.pause();
+            function paint() {{
+              if (v.paused) {{
+                b.textContent = "Play";
+                b.classList.remove("on");
+                b.setAttribute("aria-label", "Play with sound");
+              }} else if (v.muted) {{
+                b.textContent = "Sound";
+                b.classList.remove("on");
+                b.setAttribute("aria-label", "Unmute");
+              }} else {{
+                b.textContent = "Mute";
+                b.classList.add("on");
+                b.setAttribute("aria-label", "Mute");
+              }}
+            }}
+            function playLoud() {{
+              v.muted = false;
+              v.volume = 1;
+              const p = v.play();
+              if (p && p.catch) {{
+                p.catch(function() {{
+                  v.muted = true;
+                  v.play().then(function() {{ v.muted = false; paint(); }}).catch(function() {{}});
+                }});
+              }}
+              paint();
+            }}
+            b.addEventListener("click", function(ev) {{
+              ev.preventDefault();
+              ev.stopPropagation();
+              if (v.paused) playLoud();
+              else if (v.muted) {{ v.muted = false; paint(); }}
+              else {{ v.muted = true; paint(); }}
+            }});
+            v.addEventListener("click", function() {{
+              if (v.paused) playLoud();
+              else if (v.muted) {{ v.muted = false; paint(); }}
+              else {{ v.pause(); v.muted = true; paint(); }}
+            }});
+            v.addEventListener("play", paint);
+            v.addEventListener("pause", paint);
+            v.addEventListener("volumechange", paint);
+            paint();
+          }})();
+        </script>
+        """,
+        height=96,
+        scrolling=False,
+    )
+
+
 def render_little_tennis_header() -> None:
     buttons: list[str] = []
     for name in choose_rail_avatars():
@@ -9770,31 +9803,16 @@ def render_little_tennis_header() -> None:
             f'<img src="{src}" alt="" loading="lazy" />'
             f"</button>"
         )
-    poster = _hosted_media_url(os.path.join(STATIC_DIR, "poster.jpg"))
-    film = _hosted_media_url(os.path.join(STATIC_DIR, "video.mp4"))
-    # Prefer live video (muted autoplay). Poster only if the mp4 URL is missing.
-    if film:
-        media = (
-            f'<video class="lt-film lt-video" playsinline muted autoplay loop '
-            f'preload="auto" poster="{poster}" src="{film}" data-src="{film}"></video>'
-        )
-    elif poster:
-        media = (
-            f'<img class="lt-film lt-poster" src="{poster}" alt="Animals on court" '
-            f'width="720" height="90" decoding="async" />'
-        )
-    else:
-        media = ""
     st.markdown(
         '<header class="lt-head">'
         '<p class="lt-brand">www.playplaytennis.com</p>'
         '<p class="lt-tag">animals on court · let’s play</p>'
-        '<div class="lt-stage">'
-        f"{media}"
-        '<button type="button" class="lt-sound" aria-pressed="false" aria-label="Unmute">Sound</button>'
-        "</div>"
-        f'<div class="lt-rail">{"".join(buttons)}</div>'
         "</header>",
+        unsafe_allow_html=True,
+    )
+    render_header_film()
+    st.markdown(
+        f'<div class="lt-rail">{"".join(buttons)}</div>',
         unsafe_allow_html=True,
     )
 
