@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Optional
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
@@ -34,6 +35,15 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+# All game schedule "now" checks use Hong Kong wall clock (Streamlit Cloud is UTC).
+HK_TZ = ZoneInfo("Asia/Hong_Kong")
+
+
+def hk_now() -> datetime:
+    """Current Hong Kong local time as a naive datetime (for game day/time logic)."""
+    return datetime.now(HK_TZ).replace(tzinfo=None)
+
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tennis.db")
 TURSO_LOCAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tennis_turso.db")
@@ -2143,7 +2153,7 @@ def game_signup_count(game: dict) -> int:
 
 def game_is_cold(game: dict, *, now: Optional[datetime] = None) -> bool:
     """Needs people: fewer than 2 signups, or starts within 2 days."""
-    now = now or datetime.now()
+    now = now or hk_now()
     dt = game_when_datetime(game, now=now)
     days = 999
     if dt is not None:
@@ -2154,7 +2164,7 @@ def game_is_cold(game: dict, *, now: Optional[datetime] = None) -> bool:
 
 def game_urgency_multiplier(game: dict, *, now: Optional[datetime] = None) -> float:
     """1.0 when popular/plenty of time; up to ~2.2 when cold/soon."""
-    now = now or datetime.now()
+    now = now or hk_now()
     dt = game_when_datetime(game, now=now)
     days = 999
     if dt is not None:
@@ -2187,7 +2197,7 @@ def game_is_invite_urgent(game: dict, *, now: Optional[datetime] = None) -> bool
 
 
 def _today_str(*, now: Optional[datetime] = None) -> str:
-    return (now or datetime.now()).strftime("%Y-%m-%d")
+    return (now or hk_now()).strftime("%Y-%m-%d")
 
 
 def _get_invite_eval_today(game_id: int, ig_handle: str, eval_date: str) -> Optional[dict]:
@@ -2272,7 +2282,7 @@ def evaluate_game_invite(
     Returns invite copy when INVITED, else "".
     Cold games (<2 signups / ≤2 days) use a lower pass bar and force re-rolls.
     """
-    now = now or datetime.now()
+    now = now or hk_now()
     handle = normalize_handle(ig_handle)
     if not handle or not game:
         return ""
@@ -2392,7 +2402,7 @@ def resolve_join_game_id(
         if any(int(g.get("id") or 0) == gid for g in live):
             return gid
 
-    now = datetime.now()
+    now = hk_now()
     want_date = _resolve_game_date(raw, now=now)
     want_time = _extract_game_time(raw)
     want_weekday: Optional[int] = None
@@ -2731,7 +2741,7 @@ def consume_day_before_reminders(ig_handle: str) -> str:
     handle = normalize_handle(ig_handle)
     if not handle:
         return ""
-    now = datetime.now()
+    now = hk_now()
     tomorrow = (now + timedelta(days=1)).date()
     remind_key = tomorrow.isoformat()
     lines: list[str] = []
@@ -8270,7 +8280,7 @@ def _extract_game_time(text: str) -> Optional[tuple[int, int, str]]:
 
 def _resolve_game_date(text: str, *, now: Optional[datetime] = None) -> Optional[datetime]:
     """Resolve a calendar date from free text (weekday / month day / today)."""
-    now = now or datetime.now()
+    now = now or hk_now()
     lower = text.lower()
 
     if re.search(r"\btoday\b", lower):
@@ -8366,7 +8376,7 @@ def format_game_when_text(raw: str, *, now: Optional[datetime] = None) -> str:
     raw = (raw or "").strip()
     if not raw:
         return raw
-    now = now or datetime.now()
+    now = now or hk_now()
     time_bits = _extract_game_time(raw)
     date_dt = _resolve_game_date(raw, now=now)
     if date_dt and time_bits:
@@ -8400,7 +8410,7 @@ def _parse_created_at(raw: Any) -> Optional[datetime]:
 
 def game_when_datetime(game: dict, *, now: Optional[datetime] = None) -> Optional[datetime]:
     """Best-effort datetime for a stored game row (for past/upcoming filtering)."""
-    now = now or datetime.now()
+    now = now or hk_now()
     when = str((game or {}).get("when_text") or "")
     if not when.strip():
         return None
@@ -8473,19 +8483,19 @@ def game_when_datetime(game: dict, *, now: Optional[datetime] = None) -> Optiona
 
 
 def game_is_upcoming(game: dict, *, now: Optional[datetime] = None) -> bool:
-    """True when the game's calendar day is today or later. Unknown dates stay visible."""
-    now = now or datetime.now()
+    """True when the game start is still ahead (Hong Kong time). Unknown dates stay visible."""
+    now = now or hk_now()
     dt = game_when_datetime(game, now=now)
     if dt is None:
         return True
-    return dt.date() >= now.date()
+    return dt >= now
 
 
 def sort_games_chronologically(
     games: list[dict], *, now: Optional[datetime] = None
 ) -> list[dict]:
     """Soonest first (date then time). Unparseable dates last; tie-break by id."""
-    now = now or datetime.now()
+    now = now or hk_now()
     far = datetime.max.replace(tzinfo=None)
 
     def sort_key(g: dict) -> tuple:
