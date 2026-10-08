@@ -3778,7 +3778,11 @@ def _is_ig_brand_asset_url(url: str) -> bool:
 def _is_placeholder_profile_url(url: str) -> bool:
     """Instagram's logged-out default silhouette, not a person's photo."""
     low = _clean_ig_media_url(url).lower()
-    return "anonymous_profile" in low or "yw5vbnltb3vz" in low
+    if "anonymous_profile" in low:
+        return True
+    # Match path/media token only — "yw5vbnltb3vz" also appears inside unrelated CDN efg= base64.
+    path = low.split("?", 1)[0]
+    return "yw5vbnltb3vz" in path
 
 
 def _chrome_get(url: str, headers: Optional[dict] = None, timeout: int = 20):
@@ -3802,29 +3806,84 @@ def _chrome_get(url: str, headers: Optional[dict] = None, timeout: int = 20):
     return requests.get(url, headers=hdrs, timeout=timeout, allow_redirects=True)
 
 
-def _threads_profile_pic_urls(handle: str) -> tuple[list[str], str]:
+_THREADS_CARD_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _threads_profile_card(handle: str) -> dict[str, Any]:
     """
-    Public Threads page for the same account.
-    Instagram's own profile HTML is a login wall; Threads still embeds profile_pic_url.
-    Returns (urls, state) where state is real | default_avatar | unavailable.
+    Public Threads card for the same IG handle.
+    Instagram HTML is usually a login wall; Indown's DP form often returns an empty page.
+    Threads still embeds full_name / biography / follower_count / profile_pic_url.
     """
     handle = normalize_handle(handle)
+    empty: dict[str, Any] = {
+        "ok": False,
+        "missing": False,
+        "urls": [],
+        "fields": [],
+        "text": "",
+        "private": False,
+        "pic_state": "unavailable",
+    }
     if not handle:
-        return [], "unavailable"
-    try:
-        resp = _chrome_get(
-            f"https://www.threads.com/@{handle}",
-            headers={
-                "Accept": "text/html,application/xhtml+xml",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            timeout=max(SCRAPE_TIMEOUT, 18),
-        )
-    except Exception:
-        return [], "unavailable"
-    if getattr(resp, "status_code", 0) != 200 or not (getattr(resp, "text", "") or ""):
-        return [], "unavailable"
-    text = (resp.text or "").replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
+        return empty
+    cached = _THREADS_CARD_CACHE.get(handle)
+    if cached:
+        return cached
+
+    text = ""
+    for host in ("www.threads.net", "www.threads.com"):
+        try:
+            resp = _chrome_get(
+                f"https://{host}/@{handle}",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                timeout=max(SCRAPE_TIMEOUT, 18),
+            )
+        except Exception:
+            continue
+        if getattr(resp, "status_code", 0) != 200 or not (getattr(resp, "text", "") or ""):
+            continue
+        text = (resp.text or "").replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
+        if f'"username":"{handle}"' in text.replace(" ", "") or re.search(
+            rf'"username"\s*:\s*"{re.escape(handle)}"', text
+        ):
+            break
+    if not text:
+        return empty
+
+    username_m = re.search(r'"username"\s*:\s*"([^"]+)"', text)
+    if not username_m or normalize_handle(username_m.group(1)) != handle:
+        # Missing / login-wall Threads pages have no matching username blob.
+        return empty
+
+    def _json_str(raw: str) -> str:
+        try:
+            return str(json.loads(f'"{raw}"')).strip()
+        except Exception:
+            return (
+                raw.replace("\\n", "\n")
+                .replace("\\/", "/")
+                .replace('\\"', '"')
+                .replace("\\\\", "\\")
+                .strip()
+            )
+
+    full_name = ""
+    bio = ""
+    followers = ""
+    m_name = re.search(r'"full_name"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+    if m_name:
+        full_name = _json_str(m_name.group(1))
+    m_bio = re.search(r'"biography"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+    if m_bio:
+        bio = _json_str(m_bio.group(1))
+    m_fol = re.search(r'"follower_count"\s*:\s*(\d+)', text)
+    if m_fol:
+        followers = m_fol.group(1)
+
     found: list[str] = []
     for match in re.finditer(r'"profile_pic_url(?:_hd)?"\s*:\s*"(https://[^"]+)"', text):
         found.append(match.group(1))
@@ -3843,12 +3902,52 @@ def _threads_profile_pic_urls(handle: str) -> tuple[list[str], str]:
             continue
         urls.append(url)
     urls = list(dict.fromkeys(urls))
+
+    pic_state = "unavailable"
     if urls:
-        return urls, "real"
-    low = text.lower()
-    if handle in low and ("anonymous_profile" in low or "yw5vbnltb3vz" in low):
-        return [], "default_avatar"
-    return [], "unavailable"
+        pic_state = "real"
+    elif any(_is_placeholder_profile_url(_clean_ig_media_url(raw)) for raw in found):
+        pic_state = "default_avatar"
+
+    fields: list[str] = []
+    bits: list[str] = []
+    if full_name:
+        fields.append(f"full_name: {full_name}")
+        bits.append(f"full_name:{full_name}")
+    if bio:
+        fields.append(f"biography: {bio}")
+        bits.append(f"biography:{bio}")
+    if followers:
+        fields.append(f"followers:{followers}")
+        bits.append(f"followers:{followers}")
+    fields.append(f"profile_pic:{pic_state}")
+    if urls:
+        fields.append(f"threads_profile_pic:{len(urls)}")
+
+    out = {
+        "ok": bool(full_name or bio or followers or urls),
+        "missing": False,
+        "urls": urls,
+        "fields": fields,
+        "text": " | ".join(bits),
+        "private": False,
+        "pic_state": pic_state,
+        "full_name": full_name,
+        "biography": bio,
+        "followers": followers,
+    }
+    _THREADS_CARD_CACHE[handle] = out
+    return out
+
+
+def _threads_profile_pic_urls(handle: str) -> tuple[list[str], str]:
+    """
+    Public Threads page for the same account.
+    Instagram's own profile HTML is a login wall; Threads still embeds profile_pic_url.
+    Returns (urls, state) where state is real | default_avatar | unavailable.
+    """
+    card = _threads_profile_card(handle)
+    return list(card.get("urls") or []), str(card.get("pic_state") or "unavailable")
 
 
 def _is_ig_feed_media_url(url: str) -> bool:
@@ -5536,7 +5635,7 @@ def scrape_instagram_bio(
         browser = scrape_instagram_via_browser(handle)
         result = _merge_browser_into_scrape(result, browser, handle)
 
-    return _merge_indown_card(result, handle)
+    return _merge_threads_card(_merge_indown_card(result, handle), handle)
 
 
 def _merge_indown_card(result: dict[str, Any], handle: str) -> dict[str, Any]:
@@ -5571,6 +5670,37 @@ def _merge_indown_card(result: dict[str, Any], handle: str) -> dict[str, Any]:
             result["ig_photo_path"] = saved
             result["profile_photo_meta"] = _image_file_meta(saved)
             result["ok"] = True
+    return result
+
+
+def _merge_threads_card(result: dict[str, Any], handle: str) -> dict[str, Any]:
+    """
+    Fallback public card from Threads when Instagram HTML + Indown return nothing.
+    Enough for signup (_profile_card_seen) without inventing a fake account.
+    """
+    if result.get("profile_missing"):
+        return result
+    if _profile_card_seen(result):
+        return result
+    card = _threads_profile_card(handle)
+    if not card.get("ok"):
+        return result
+    for field in card.get("fields") or []:
+        if field not in (result.get("fields") or []):
+            result.setdefault("fields", []).append(field)
+    if card.get("text"):
+        result["text"] = ((result.get("text") or "") + " | threads:" + card["text"])[:2400]
+        for em in _extract_profile_emojis(card["text"]):
+            if em not in result.setdefault("emojis", []):
+                result["emojis"].append(em)
+    if card.get("urls") and not result.get("ig_photo_path"):
+        saved = download_ig_profile_photo(handle, extra_urls=list(card["urls"]))
+        if saved:
+            result["ig_photo_path"] = saved
+            result["profile_photo_meta"] = _image_file_meta(saved)
+    result["ok"] = True
+    result["status"] = "threads_card"
+    result["note"] = (result.get("note") or "") + " Public card from Threads (IG login wall / Indown empty)."
     return result
 
 
