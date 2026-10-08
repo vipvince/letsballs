@@ -2821,13 +2821,14 @@ def persona_line(user: dict) -> tuple[str, Optional[str]]:
 
 
 def admin_today_markdown() -> str:
-    """Compact admin ops board for chat."""
-    games = list_games()
+    """Compact admin ops board for chat — games, subscribers, invite stats."""
+    games = list_game_signups()
     today = _today_str()
-    blocks = ["**Today**"]
+    blocks = ["**Today · admin dashboard**"]
     if not games:
-        blocks.append("_No upcoming games._")
+        blocks.append("_No upcoming games on the board._")
     else:
+        blocks.append("**Available games**")
         for g in games:
             when = format_game_when_text(g.get("when_text") or "") or "TBD"
             loc = g.get("location") or DEFAULT_GAME_LOCATION
@@ -2835,12 +2836,18 @@ def admin_today_markdown() -> str:
                 spots = int(g.get("spots") or 0)
             except (TypeError, ValueError):
                 spots = g.get("spots")
-            signed = game_signup_count(g)
+            people = g.get("signups") or []
+            signed = len(people)
             cold = " · **COLD**" if game_is_cold(g) and int(spots or 0) > 0 else ""
             blocks.append(
-                f"- **#{g['id']}** · {when} @ {loc} — "
-                f"{signed} in · {spots} open{cold}"
+                f"\n**#{g['id']}** · {when}  \n"
+                f"📍 {loc} — **{signed} in** · {spots} open{cold}"
             )
+            if people:
+                for s in people:
+                    blocks.append(f"- @{s.get('ig_handle')}")
+            else:
+                blocks.append("- _(nobody subscribed yet)_")
     with get_conn() as conn:
         inv = conn.execute(
             """
@@ -2872,6 +2879,73 @@ def admin_today_markdown() -> str:
         blocks.append("**Unread joins** — none")
     blocks.append("\n_Shortcuts: `games` · `signups` · `msg @handle …` · `as @handle`_")
     return "\n".join(blocks)
+
+
+def render_admin_dashboard_card() -> None:
+    """Persistent bordered card for admins: open games + who subscribed."""
+    user = st.session_state.get("user")
+    if st.session_state.get("auth_state") != LOGGED_IN:
+        return
+    if not user or not is_admin(user) or is_impersonating():
+        return
+
+    games = list_game_signups()
+    today = _today_str()
+    with get_conn() as conn:
+        inv = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM game_invite_evals
+            WHERE eval_date = ? AND status = 'INVITED'
+            """,
+            (today,),
+        ).fetchone()
+        skip = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM game_invite_evals
+            WHERE eval_date = ? AND status = 'SKIPPED_LOCK'
+            """,
+            (today,),
+        ).fetchone()
+    inv_n = int(_as_dict(inv).get("c") or 0)
+    skip_n = int(_as_dict(skip).get("c") or 0)
+    pending = pending_admin_signup_notices()
+
+    with st.container(border=True):
+        st.markdown("### Today · admin")
+        st.caption(
+            f"HK {hk_now().strftime('%Y-%m-%d %H:%M')} · "
+            f"invites {inv_n} sent / {skip_n} skipped · "
+            f"unread joins {len(pending)}"
+        )
+        if not games:
+            st.info("No upcoming games on the board.")
+        else:
+            for i, g in enumerate(games):
+                when = format_game_when_text(g.get("when_text") or "") or "TBD"
+                loc = g.get("location") or DEFAULT_GAME_LOCATION
+                try:
+                    spots = int(g.get("spots") or 0)
+                except (TypeError, ValueError):
+                    spots = 0
+                people = g.get("signups") or []
+                cold = game_is_cold(g) and spots > 0
+                title = f"**#{g['id']}** · {when}"
+                if cold:
+                    title += " · COLD"
+                st.markdown(title)
+                st.caption(f"{loc} · {len(people)} subscribed · {spots} open")
+                if people:
+                    handles = ", ".join(f"@{s.get('ig_handle')}" for s in people)
+                    st.markdown(handles)
+                else:
+                    st.markdown("_Nobody subscribed yet_")
+                if i < len(games) - 1:
+                    st.divider()
+        if pending:
+            st.markdown("**Unread joins**")
+            for r in pending[:8]:
+                st.markdown(f"- @{r.get('ig_handle')} → #{r.get('game_id')}")
+        st.caption("Type `today` · `signups` · `as @handle`")
 
 
 def game_join_reply(status: str, game: dict, user: Optional[dict] = None) -> str:
@@ -10018,6 +10092,13 @@ def run_quick_action(action: str) -> None:
             return
         append_assistant(games_board_markdown())
         return
+    if key in {"today", "dashboard"}:
+        append_user("Today", avatar=avatar)
+        if is_admin(user) and not is_impersonating():
+            append_assistant(admin_today_markdown())
+        else:
+            append_assistant("Admin dashboard only — type `back` if you’re testing a member.")
+        return
     if key in {"help", "tips"}:
         append_user("Help" if is_admin(user) else "Tips", avatar=avatar)
         if is_admin(user):
@@ -10039,6 +10120,8 @@ def render_quick_actions() -> Optional[str]:
     open_games = [g for g in upcoming if int(g.get("spots") or 0) > 0]
 
     labels: list[tuple[str, str]] = []
+    if is_admin(user) and not is_impersonating():
+        labels.append(("today", "📋 Today"))
     # One Join button per open game (max 3) so the right slot is obvious
     for g in open_games[:3]:
         when_bit = short_game_when(g.get("when_text") or "")
@@ -10944,6 +11027,8 @@ def main() -> None:
     if st.session_state.get("auth_state") == NEED_LANG or st.session_state.get("_show_lang_card"):
         focus_chat_input()
         return
+
+    render_admin_dashboard_card()
 
     quick = render_quick_actions()
     if quick:
