@@ -104,7 +104,7 @@ INVITE_URGENT_THRESHOLD = 48  # lower bar when cold/soon
 INVITE_COLD_THRESHOLD = 38  # even lower when <2 signups or ≤2 days
 INVITE_RAND_LOW = 0.8
 INVITE_RAND_HIGH = 1.2
-GAMES_CACHE_SECONDS = 120
+GAMES_CACHE_SECONDS = 300  # per-session board cache; writes invalidate
 GITHUB_MEDIA_BASE = "https://raw.githubusercontent.com/vipvince/letsballs/main"
 WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LqLATzTW38oEUKIcXxXiDw?s=cl&p=i&mlu=4&ilr=4"
 THREADS_CARD_TTL_SEC = 6 * 60 * 60  # keep Threads public cards warm for 6h
@@ -756,8 +756,9 @@ _COPY_EN: dict[str, str] = {
     "tips": (
         "**Quick tips**\n\n"
         "- **Games** — see upcoming sessions when they appear for you\n"
-        "- **Mine** / `my games` — sessions you’ve already joined\n"
+        "- **Mine** / `my games` — your sessions, countdown, WhatsApp, cancel\n"
         "- **Join** — type `join` to pick a game, or `join #4` / `join Oct 10 11am`\n"
+        "- **Leave** — `leave #3` (or tap Leave on Mine) to cancel a signup\n"
         "- Ask about racquets, weather, courts — tennis talk is welcome\n"
         "- Type `logout` to switch accounts\n"
         "- Language: type `lang` to open the EN / 繁體中文 card"
@@ -780,6 +781,10 @@ _COPY_EN: dict[str, str] = {
     "my_games_none": "You’re not signed up for an upcoming game yet. Type `games` to see what’s open.",
     "my_games_header": "**Your games**",
     "opener_your_games": "Here’s what you’re down for:",
+    "leave_ok": "You’re out of **#{gid} · {when}** @ {loc}. Spot is open again.",
+    "leave_missing": "You’re not signed up for that game. Type `mine` to see your list.",
+    "leave_none": "You’re not signed up for any upcoming game.",
+    "leave_which": "Which game do you want to leave?\n\n{options}\n\nReply `leave #3`.",
     "join_which": (
         "Which game do you want?\n\n"
         "{options}\n\n"
@@ -812,8 +817,9 @@ _COPY_YUE: dict[str, str] = {
     "tips": (
         "**小提示**\n\n"
         "- **Games** — 睇吓有咩場（有排期先會出現）\n"
-        "- **Mine** / `my games` — 你已報名嘅場\n"
+        "- **Mine** / `my games` — 你嘅場、倒數、WhatsApp、取消\n"
         "- **Join** — 打 `join` 揀場，或 `join #4` / `join Oct 10 11am`\n"
+        "- **Leave** — `leave #3`（或 Mine 撳 Leave）取消報名\n"
         "- 球拍、天氣、球場都可以傾\n"
         "- 打 `logout` 換帳號\n"
         "- 語言：打 `lang` 打開 EN / 繁體中文 卡片"
@@ -833,6 +839,10 @@ _COPY_YUE: dict[str, str] = {
     "my_games_none": "你未報名即將嚟嘅場。打 `games` 睇吓有咩開放。",
     "my_games_header": "**你嘅場次**",
     "opener_your_games": "你報咗呢啲場：",
+    "leave_ok": "已退出 **#{gid} · {when}** @ {loc}。名額已放返出嚟。",
+    "leave_missing": "你未報呢場。打 `mine` 睇吓你嘅名單。",
+    "leave_none": "你未報任何即將嚟嘅場。",
+    "leave_which": "想退出邊場？\n\n{options}\n\n回覆 `leave #3`。",
     "join_which": (
         "想入邊場？\n\n"
         "{options}\n\n"
@@ -1295,6 +1305,8 @@ def _db_schema_ready() -> bool:
             conn.execute("ALTER TABLE users ADD COLUMN invite_score_override INTEGER")
         if "lang" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN lang TEXT")
+        if "last_seen_at" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
         signup_cols = _col_names(conn.execute("PRAGMA table_info(game_signups)").fetchall())
         if signup_cols and "admin_seen" not in signup_cols:
             conn.execute(
@@ -1303,6 +1315,12 @@ def _db_schema_ready() -> bool:
         _run_script(
             conn,
             """
+            CREATE TABLE IF NOT EXISTS admin_digest_log (
+                digest_date TEXT PRIMARY KEY,
+                sent_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                detail TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS game_invite_evals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 game_id INTEGER NOT NULL,
@@ -1687,8 +1705,24 @@ def list_games(limit: int = 40, include_past: bool = False) -> list[dict]:
 
 def _invalidate_games_cache() -> None:
     for key in list(st.session_state.keys()):
-        if str(key).startswith("_games_cache"):
+        if str(key).startswith("_games_cache") or str(key).startswith("_signups_cache"):
             st.session_state.pop(key, None)
+
+
+def touch_user_last_seen(ig_handle: str) -> None:
+    """Record last app activity (HK wall clock) for daily admin digests."""
+    handle = normalize_handle(ig_handle)
+    if not handle:
+        return
+    stamp = hk_now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE users SET last_seen_at = ? WHERE lower(ig_handle) = ?",
+                (stamp, handle),
+            )
+    except Exception:
+        pass
 
 
 def insert_game(
@@ -2038,6 +2072,12 @@ def member_tips_text(user: Optional[dict] = None) -> str:
 
 def list_game_signups(*, cold_first: bool = False) -> list[dict]:
     """Upcoming games with signup handles, soonest first (optional cold-first)."""
+    cache_key = f"_signups_cache_{int(cold_first)}"
+    cached = st.session_state.get(cache_key)
+    cache_ts = float(st.session_state.get(f"{cache_key}_ts") or 0)
+    if cached is not None and (time.time() - cache_ts) < GAMES_CACHE_SECONDS:
+        return list(cached)
+
     with get_conn() as conn:
         conn.execute(
             """
@@ -2085,6 +2125,8 @@ def list_game_signups(*, cold_first: bool = False) -> list[dict]:
                 int(g.get("id") or 0),
             )
         )
+    st.session_state[cache_key] = list(out)
+    st.session_state[f"{cache_key}_ts"] = time.time()
     return out
 
 
@@ -2108,21 +2150,49 @@ def member_joined_games(ig_handle: str) -> list[dict]:
     return sort_games_chronologically(games)
 
 
+def game_countdown_label(game: dict, *, now: Optional[datetime] = None) -> str:
+    """Human countdown to game start (HK time), e.g. 'in 2d 5h' / 'in 3h' / 'soon'."""
+    now = now or hk_now()
+    dt = game_when_datetime(game, now=now)
+    if dt is None:
+        return ""
+    secs = (dt - now).total_seconds()
+    if secs <= 0:
+        return "started / past"
+    hours = int(secs // 3600)
+    mins = int((secs % 3600) // 60)
+    if hours >= 48:
+        days = hours // 24
+        rem_h = hours % 24
+        return f"in {days}d {rem_h}h"
+    if hours >= 1:
+        return f"in {hours}h {mins}m" if mins else f"in {hours}h"
+    if mins >= 1:
+        return f"in {mins}m"
+    return "soon"
+
+
 def member_my_games_markdown(user: Optional[dict] = None) -> str:
-    """Member-facing list of games they’ve joined."""
+    """Member-facing list: countdown, WhatsApp, cancel hint."""
     u = user or st.session_state.get("user") or {}
     lang = user_lang(u)
     games = member_joined_games(u.get("ig_handle") or "")
     if not games:
         return t("my_games_none", lang)
     blocks = [t("my_games_header", lang)]
+    now = hk_now()
     for g in games:
         when = format_game_when_text(g.get("when_text") or "") or "TBD"
         loc = g.get("location") or DEFAULT_GAME_LOCATION
-        blocks.append(f"- **#{g['id']}** · {when} · {loc}")
-    blocks.append(f"\nWhatsApp: [join group]({WHATSAPP_GROUP_URL})")
-    blocks.append(f"Copy link: `{WHATSAPP_GROUP_URL}`")
-    return "\n".join(blocks)
+        cd = game_countdown_label(g, now=now)
+        cd_bit = f" · _{cd}_" if cd else ""
+        blocks.append(
+            f"**#{g['id']}** · {when}{cd_bit}  \n"
+            f"📍 {loc}  \n"
+            f"→ `leave #{g['id']}` to cancel"
+        )
+    blocks.append("\n" + whatsapp_link_block())
+    return "\n\n".join(blocks)
 
 
 def whatsapp_link_block() -> str:
@@ -2131,6 +2201,83 @@ def whatsapp_link_block() -> str:
         f"[Join the WhatsApp group]({WHATSAPP_GROUP_URL})\n"
         f"Copy link: `{WHATSAPP_GROUP_URL}`"
     )
+
+
+def member_leave_game(user: dict, text: str) -> bool:
+    """
+    Handle leave/cancel intents for the logged-in member.
+    Returns True if the message was consumed.
+    """
+    handle = normalize_handle((user or {}).get("ig_handle") or "")
+    if not handle:
+        return False
+    raw = (text or "").strip()
+    lower = raw.lower()
+    lang = user_lang(user)
+    leave_bare = bool(
+        re.fullmatch(r"(leave|cancel|quit|退出|唔去|不去)[.!\s]*", lower, re.I)
+    )
+    m = re.search(
+        r"(?:leave|cancel|quit|退出)\s*(?:game\s*)?#?\s*(\d+)\b",
+        lower,
+        re.I,
+    )
+    prefer: Optional[int] = int(m.group(1)) if m else None
+    mine = member_joined_games(handle)
+    if not mine:
+        if leave_bare or prefer is not None or re.search(r"\bleave\b|退出", lower):
+            append_assistant(t("leave_none", lang))
+            return True
+        return False
+    if prefer is None and not leave_bare:
+        if not re.search(r"\bleave\b|\bcancel\b|退出|唔去", lower):
+            return False
+    if prefer is None:
+        if len(mine) == 1:
+            prefer = int(mine[0]["id"])
+        else:
+            lines = []
+            for g in mine:
+                when = format_game_when_text(g.get("when_text") or "") or "TBD"
+                lines.append(f"- **#{g['id']}** · {when}")
+            append_assistant(t("leave_which", lang, options="\n".join(lines)))
+            return True
+    status, game = remove_game_signup(handle, prefer)
+    if status == "removed":
+        when = format_game_when_text((game or {}).get("when_text") or "") or "that game"
+        loc = (game or {}).get("location") or DEFAULT_GAME_LOCATION
+        append_assistant(
+            t("leave_ok", lang, gid=game.get("id"), when=when, loc=loc)
+        )
+    else:
+        append_assistant(t("leave_missing", lang))
+    return True
+
+
+def render_member_mine_actions() -> Optional[str]:
+    """One-tap Leave buttons after Mine is shown."""
+    if not st.session_state.get("_member_mine_actions"):
+        return None
+    user = st.session_state.get("user")
+    if not user:
+        return None
+    # Real admin dashboard uses Today actions; allow when impersonating a member
+    if is_admin(user) and not is_impersonating():
+        return None
+    games = member_joined_games(user.get("ig_handle") or "")
+    if not games:
+        return None
+    st.caption("Cancel a game")
+    cols = st.columns(min(3, len(games)))
+    clicked = None
+    for i, g in enumerate(games[:6]):
+        gid = int(g["id"])
+        with cols[i % len(cols)]:
+            if st.button(f"Leave #{gid}", key=f"mine_leave_{gid}", use_container_width=True):
+                clicked = f"leave #{gid}"
+    if clicked:
+        st.session_state.pop("_member_mine_actions", None)
+    return clicked
 
 
 def signups_as_context() -> str:
@@ -2180,7 +2327,7 @@ def remove_game_signup(ig_handle: str, game_id: Optional[int] = None) -> tuple[s
                 SELECT s.id AS signup_id, g.id, g.when_text, g.location, g.spots
                 FROM game_signups s
                 JOIN games g ON g.id = s.game_id
-                WHERE s.ig_handle = ? AND s.game_id = ?
+                WHERE lower(s.ig_handle) = ? AND s.game_id = ?
                 """,
                 (handle, int(game_id)),
             ).fetchone()
@@ -2190,7 +2337,7 @@ def remove_game_signup(ig_handle: str, game_id: Optional[int] = None) -> tuple[s
                 SELECT s.id AS signup_id, g.id, g.when_text, g.location, g.spots
                 FROM game_signups s
                 JOIN games g ON g.id = s.game_id
-                WHERE s.ig_handle = ?
+                WHERE lower(s.ig_handle) = ?
                 ORDER BY s.id DESC
                 LIMIT 1
                 """,
@@ -2820,6 +2967,171 @@ def notify_admins_of_join(ig_handle: str, game: dict) -> None:
     send_admin_email(subject, body)
 
 
+def _sql_ts_since(hours: int = 24) -> str:
+    """SQLite/libsql-friendly cutoff timestamp string (HK wall clock)."""
+    return (hk_now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def build_daily_admin_digest(*, hours: int = 24) -> str:
+    """Plain-text digest: recent logins + new joins (last N hours, HK time)."""
+    since = _sql_ts_since(hours)
+    now = hk_now()
+    lines = [
+        f"playplaytennis daily digest",
+        f"Window: last {hours}h (as of {now.strftime('%Y-%m-%d %H:%M')} HK)",
+        "",
+    ]
+    with get_conn() as conn:
+        logins = conn.execute(
+            """
+            SELECT ig_handle, last_seen_at, animal, mascot, invite_score, invite_score_override
+            FROM users
+            WHERE last_seen_at IS NOT NULL AND last_seen_at >= ?
+            ORDER BY last_seen_at DESC
+            LIMIT 40
+            """,
+            (since,),
+        ).fetchall()
+        joins = conn.execute(
+            """
+            SELECT s.ig_handle, s.created_at, g.id AS game_id, g.when_text, g.location
+            FROM game_signups s
+            JOIN games g ON g.id = s.game_id
+            WHERE s.created_at IS NOT NULL AND s.created_at >= ?
+            ORDER BY s.id DESC
+            LIMIT 40
+            """,
+            (since,),
+        ).fetchall()
+    login_rows = [_as_dict(r) for r in logins]
+    join_rows = [_as_dict(r) for r in joins]
+    lines.append(f"LOGINS ({len(login_rows)})")
+    if not login_rows:
+        lines.append("- (none)")
+    else:
+        for r in login_rows:
+            h = r.get("ig_handle")
+            seen = r.get("last_seen_at") or "?"
+            animal = r.get("mascot") or r.get("animal") or ""
+            lines.append(f"- @{h} · last seen {seen}" + (f" · {animal}" if animal else ""))
+    lines.append("")
+    lines.append(f"NEW JOINS ({len(join_rows)})")
+    if not join_rows:
+        lines.append("- (none)")
+    else:
+        for r in join_rows:
+            when = format_game_when_text(r.get("when_text") or "") or "TBD"
+            loc = r.get("location") or DEFAULT_GAME_LOCATION
+            lines.append(
+                f"- @{r.get('ig_handle')} → #{r.get('game_id')} · {when} @ {loc} "
+                f"(signed {r.get('created_at')})"
+            )
+    lines.append("")
+    lines.append("In chat: `today` · `invites` · `signups`")
+    return "\n".join(lines)
+
+
+def maybe_send_daily_admin_digest(*, force: bool = False) -> tuple[str, str]:
+    """
+    Email admin once per HK calendar day with logins + joins.
+    Returns (status, detail) where status is sent|skipped|error|empty_creds.
+    """
+    today = _today_str()
+    if not force:
+        with get_conn() as conn:
+            prior = conn.execute(
+                "SELECT digest_date FROM admin_digest_log WHERE digest_date = ?",
+                (today,),
+            ).fetchone()
+        if prior:
+            return "skipped", f"already sent for {today}"
+    body = build_daily_admin_digest(hours=24)
+    ok, detail = send_admin_email(f"[playplaytennis] daily digest {today}", body)
+    if not ok:
+        return ("empty_creds" if "Set " in detail else "error"), detail
+    stamp = hk_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        prior = conn.execute(
+            "SELECT digest_date FROM admin_digest_log WHERE digest_date = ?",
+            (today,),
+        ).fetchone()
+        if prior:
+            conn.execute(
+                "UPDATE admin_digest_log SET sent_at = ?, detail = ? WHERE digest_date = ?",
+                (stamp, detail[:200], today),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO admin_digest_log (digest_date, sent_at, detail) VALUES (?, ?, ?)",
+                (today, stamp, detail[:200]),
+            )
+    return "sent", detail
+
+
+def invite_fairness_markdown(*, eval_date: Optional[str] = None) -> str:
+    """Admin view: who was invited / skipped today and the score × urgency math."""
+    day = eval_date or _today_str()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.game_id, e.ig_handle, e.status, e.final_weight, e.user_score, e.urgency,
+                   g.when_text, g.location, g.spots
+            FROM game_invite_evals e
+            LEFT JOIN games g ON g.id = e.game_id
+            WHERE e.eval_date = ?
+            ORDER BY e.status ASC, e.final_weight DESC, e.ig_handle ASC
+            """,
+            (day,),
+        ).fetchall()
+    items = [_as_dict(r) for r in rows]
+    blocks = [
+        f"**Invite fairness · {day} (HK)**",
+        f"_Pass bar normal ≈ {INVITE_PASS_THRESHOLD} · urgent ≈ {INVITE_URGENT_THRESHOLD} · cold ≈ {INVITE_COLD_THRESHOLD}_",
+        "_weight = score × urgency × luck (0.8–1.2)_",
+    ]
+    if not items:
+        blocks.append("_No invite rolls logged today yet._")
+        return "\n".join(blocks)
+    invited = [r for r in items if (r.get("status") or "").upper() == "INVITED"]
+    skipped = [r for r in items if (r.get("status") or "").upper() != "INVITED"]
+    blocks.append(f"\n**INVITED ({len(invited)})**")
+    if not invited:
+        blocks.append("- (none)")
+    for r in invited:
+        when = format_game_when_text(r.get("when_text") or "") or f"#{r.get('game_id')}"
+        score = r.get("user_score")
+        urg = r.get("urgency")
+        wt = r.get("final_weight")
+        try:
+            wt_s = f"{float(wt):.1f}"
+        except (TypeError, ValueError):
+            wt_s = str(wt)
+        blocks.append(
+            f"- @{r.get('ig_handle')} → **#{r.get('game_id')}** {when}  \n"
+            f"  score **{score}** × urgency **{urg}** → weight **{wt_s}** → INVITED"
+        )
+    blocks.append(f"\n**SKIPPED ({len(skipped)})**")
+    if not skipped:
+        blocks.append("- (none)")
+    for r in skipped[:30]:
+        when = format_game_when_text(r.get("when_text") or "") or f"#{r.get('game_id')}"
+        score = r.get("user_score")
+        urg = r.get("urgency")
+        wt = r.get("final_weight")
+        status = (r.get("status") or "SKIPPED").upper()
+        try:
+            wt_s = f"{float(wt):.1f}"
+        except (TypeError, ValueError):
+            wt_s = str(wt)
+        blocks.append(
+            f"- @{r.get('ig_handle')} → **#{r.get('game_id')}** {when}  \n"
+            f"  score **{score}** × urgency **{urg}** → weight **{wt_s}** → {status}"
+        )
+    if len(skipped) > 30:
+        blocks.append(f"_…and {len(skipped) - 30} more skipped_")
+    return "\n".join(blocks)
+
+
 def queue_admin_dm(to_handle: str, body: str, from_handle: str = "vip") -> tuple[str, Optional[dict]]:
     """Queue a note the member sees next time they chat. Returns (status, user)."""
     handle = normalize_handle(to_handle)
@@ -3038,7 +3350,15 @@ def admin_today_markdown() -> str:
             )
     else:
         blocks.append("**Unread joins** — none")
-    blocks.append("\n_Shortcuts: `fill #3` · `msg @handle …` · `as @handle` · `games`_")
+    # Compact invite fairness peek
+    fairness = invite_fairness_markdown()
+    if "No invite rolls" not in fairness:
+        blocks.append("\n" + fairness)
+    else:
+        blocks.append("\n_Invite rolls today: none yet — type `invites` anytime._")
+    blocks.append(
+        "\n_Shortcuts: `fill #3` · `msg @handle …` · `invites` · `digest` · `as @handle`_"
+    )
     return "\n".join(blocks)
 
 
@@ -3395,6 +3715,8 @@ def admin_help_text() -> str:
         "- `full game #3` / `spots #3 2` — fill headcount or set open spots\n"
         "- `delete game #3` — remove game + signups\n"
         "- `games` / `signups` / `today` — board, who’s in; Today shows cold-first + fill/msg taps\n"
+        "- `invites` / `fairness` — who got invited/skipped today (score × urgency)\n"
+        "- `digest` — email + show daily logins & new joins (also auto once/day on admin open)\n"
         "- `remove @handle` or `remove @handle from #3` — free a spot\n\n"
         "**Members**\n"
         "- `user @handle` — profile + invite score (admin only)\n"
@@ -3408,7 +3730,7 @@ def admin_help_text() -> str:
         "**Other**\n"
         "- `db` — storage status (local vs Turso)\n"
         "- `help` · `logout`\n"
-        "- Join alerts email → `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` "
+        "- Join + daily digest email → `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` "
         "(+ optional `ADMIN_NOTIFY_EMAIL`) in Streamlit secrets\n\n"
         "**Cloud sleep:** Community Cloud hibernates after ~12h with no visits. "
         "Wake via the button, or ping the app URL every few hours "
@@ -3479,6 +3801,23 @@ def try_admin_command(text: str) -> bool:
     if lower in {"today", "dash", "dashboard", "/today", "ops"}:
         append_assistant(admin_today_markdown())
         st.session_state["_admin_today_actions"] = True
+        return True
+    if lower in {"invites", "/invites", "fairness", "invite log", "invite fairness"}:
+        append_assistant(invite_fairness_markdown())
+        return True
+    if lower in {"digest", "/digest", "daily digest", "digest force"}:
+        status, detail = maybe_send_daily_admin_digest(force=True)
+        body = build_daily_admin_digest(hours=24)
+        if status == "sent":
+            append_assistant(f"**Daily digest emailed** ✅\n\n```\n{body}\n```")
+        elif status == "empty_creds":
+            append_assistant(
+                f"**Digest preview** (email not configured — {detail})\n\n```\n{body}\n```"
+            )
+        else:
+            append_assistant(
+                f"**Digest preview** (email: {status} — {detail})\n\n```\n{body}\n```"
+            )
         return True
     # Impersonation exit — also reachable while testing a member (see handle_logged_in)
     if lower in {"back", "unimpersonate", "as me", "stop as", "stop impersonating"}:
@@ -9388,6 +9727,8 @@ def _apply_restored_user(user: dict) -> None:
             append_assistant(lang_prompt_text(), image=photo_path)
         return
     st.session_state.auth_state = LOGGED_IN
+    touch_user_last_seen(user.get("ig_handle") or "")
+    st.session_state["_last_seen_touched"] = True
     if not st.session_state.messages:
         line, photo_path = persona_line(user)
         inbox = member_inbox_bits(user.get("ig_handle") or "") if not is_admin(user) else ""
@@ -10362,6 +10703,7 @@ def run_quick_action(action: str) -> None:
     if key in {"mine", "my_games"}:
         append_user("My games", avatar=avatar)
         append_assistant(member_my_games_markdown(user))
+        st.session_state["_member_mine_actions"] = True
         return
     if key in {"help", "tips"}:
         append_user("Help" if is_admin(user) else "Tips", avatar=avatar)
@@ -10745,23 +11087,22 @@ def finish_pending_ig_scan() -> bool:
     worker = threading.Thread(target=_work, daemon=True)
     worker.start()
 
-    bar = st.progress(8, text="Finding your court vibe…")
+    bar = st.progress(15, text="Matching your vibe…")
     t0 = time.time()
     almost_lines = (
         "Almost there…",
-        "Hang tight — finishing up…",
+        "Hang tight…",
         "Nearly done…",
-        "Last stretch…",
     )
     try:
         while not done["ok"]:
             elapsed = time.time() - t0
-            pct = min(94, max(8, int(8 + elapsed * 5.5)))
-            if elapsed >= 8:
+            pct = min(94, max(15, int(15 + elapsed * 14)))
+            if elapsed >= 2.5:
                 bar.progress(pct, text=f"{random.choice(almost_lines)} {pct}%")
             else:
-                bar.progress(pct, text=f"Finding your court vibe… {pct}%")
-            time.sleep(0.45)
+                bar.progress(pct, text=f"Matching your vibe… {pct}%")
+            time.sleep(0.22)
         worker.join(timeout=2)
     finally:
         bar.empty()
@@ -10921,6 +11262,8 @@ def complete_admin_login(user: dict, welcome: str = "Back on court") -> None:
     fresh = get_user_by_handle(user.get("ig_handle") or "") or user
     st.session_state.user = fresh
     persist_login(fresh)
+    touch_user_last_seen(fresh.get("ig_handle") or "")
+    st.session_state["_last_seen_touched"] = True
     line, photo_path = persona_line(fresh)
     invite = maybe_game_invite(user=fresh) if user_can_be_invited(fresh) else ""
     notices = consume_admin_signup_notices() if is_admin(fresh) else ""
@@ -10964,6 +11307,8 @@ def start_member_session(user: dict, *, signup: bool = False) -> None:
     st.session_state.handle_locked = False
     st.session_state.locked_handle = ""
     persist_login(fresh)
+    touch_user_last_seen(fresh.get("ig_handle") or "")
+    st.session_state["_last_seen_touched"] = True
     if needs_lang_pick(fresh):
         st.session_state.auth_state = NEED_LANG
         st.session_state["_lang_after_signup"] = bool(signup)
@@ -11062,6 +11407,9 @@ def handle_logged_in(text: str) -> None:
         return
     if lower in {"mine", "my games", "my game", "/mine", "joined"}:
         append_assistant(member_my_games_markdown(user))
+        st.session_state["_member_mine_actions"] = True
+        return
+    if member_leave_game(user, text):
         return
     if lower in {"board", "games", "/games", "list games", "upcoming", "upcoming games"}:
         if not user_sees_games(user) and not is_admin(user):
@@ -11183,9 +11531,27 @@ def handle_logged_in(text: str) -> None:
             history.append({"role": msg["role"], "content": msg["content"]})
     history.append({"role": "user", "content": text})
 
-    with st.spinner("Thinking…"):
+    # Defer DeepSeek until after first paint (user bubble already on screen)
+    st.session_state["_pending_llm"] = {
+        "history": history,
+        "extra": extra,
+        "lang": lang,
+    }
+
+
+def flush_pending_deepseek() -> bool:
+    """Run deferred DeepSeek after messages have painted. Returns True if handled."""
+    pending = st.session_state.pop("_pending_llm", None)
+    if not pending:
+        return False
+    history = pending.get("history") or []
+    extra = pending.get("extra") or ""
+    lang = pending.get("lang")
+    user = st.session_state.get("user")
+    with st.spinner("…"):
         reply = deepseek_chat(history, extra_system=extra, lang=lang)
     append_assistant(reply + maybe_game_invite(reply, user=user))
+    return True
 
 
 def process_user_input(text: str) -> None:
@@ -11295,8 +11661,32 @@ def main() -> None:
         )
     render_messages()
 
+    # After user bubble paints, run deferred DeepSeek
+    if flush_pending_deepseek():
+        st.rerun()
+
     if finish_pending_ig_scan():
         st.rerun()
+
+    # Daily digest email once per HK day when admin opens the app
+    _user = st.session_state.get("user")
+    if (
+        st.session_state.get("auth_state") == LOGGED_IN
+        and _user
+        and is_admin(_user)
+        and not is_impersonating()
+        and not st.session_state.get("_digest_checked")
+    ):
+        st.session_state["_digest_checked"] = True
+        maybe_send_daily_admin_digest(force=False)
+
+    if (
+        st.session_state.get("auth_state") == LOGGED_IN
+        and _user
+        and not st.session_state.get("_last_seen_touched")
+    ):
+        touch_user_last_seen(_user.get("ig_handle") or "")
+        st.session_state["_last_seen_touched"] = True
 
     lang_choice = render_lang_pick_card()
     if lang_choice:
@@ -11311,6 +11701,11 @@ def main() -> None:
     today_cmd = render_admin_today_actions()
     if today_cmd:
         process_user_input(today_cmd)
+        st.rerun()
+
+    mine_cmd = render_member_mine_actions()
+    if mine_cmd:
+        process_user_input(mine_cmd)
         st.rerun()
 
     quick = render_quick_actions()
