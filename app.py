@@ -804,6 +804,8 @@ _COPY_EN: dict[str, str] = {
         "See you on court 🎾"
     ),
     "heads_up": "**Heads up**",
+    "when_note_today": " (today)",
+    "when_note_tomorrow": " (tomorrow)",
     "invite_1": "By the way — spot open for **{label}** @ {loc}. Want in?",
     "invite_2": "Quick one — **{label}** at {loc} still has space. Say yes and I’ll hold it.",
     "invite_3": "Got a free spot for **{label}** @ {loc} — join?",
@@ -862,6 +864,8 @@ _COPY_YUE: dict[str, str] = {
         "球場見 🎾"
     ),
     "heads_up": "**提提你**",
+    "when_note_today": "（今日）",
+    "when_note_tomorrow": "（明日）",
     "invite_1": "對了，順便問下 — **{label}** 有場 tennis（{loc}）有位，你得閒 join 嗎？",
     "invite_2": "喔對了，**{label}** @ {loc} 仲有位，想唔想 join？",
     "invite_3": "得閒嗎？**{label}** @ {loc} 仲有位，join 唔 join？",
@@ -1999,16 +2003,32 @@ def mark_admin_signups_seen(signup_ids: list[int]) -> None:
         )
 
 
-def default_member_game_reminder_note(game_id: Any, when_text: str = "") -> str:
-    """Default admin→member nudge with full game details (not 'still good?')."""
+def default_member_game_reminder_note(
+    game_id: Any,
+    when_text: str = "",
+    location: str = "",
+) -> str:
+    """Bubbly admin→member nudge with full game details."""
     when = format_game_when_text(when_text or "") or "soon"
-    return f"reminder — you have game #{game_id} · {when}, see ya."
+    loc = (location or "").strip() or DEFAULT_GAME_LOCATION
+    return (
+        f"Hey! Happy reminder — you’re down for game #{game_id} · {when} @ {loc}. "
+        f"Can’t wait to see you on court — it’s gonna be a blast 🎾"
+    )
 
 
-def admin_msg_game_cmd(handle: str, game_id: Any, when_text: str = "") -> str:
+def admin_msg_game_cmd(
+    handle: str,
+    game_id: Any,
+    when_text: str = "",
+    location: str = "",
+) -> str:
     """Chat command string for Today / signup shortcuts."""
     h = normalize_handle(handle)
-    return f"msg @{h} {default_member_game_reminder_note(game_id, when_text)}"
+    return (
+        f"msg @{h} "
+        f"{default_member_game_reminder_note(game_id, when_text, location)}"
+    )
 
 
 def format_admin_signup_notices(rows: list[dict]) -> str:
@@ -2026,7 +2046,7 @@ def format_admin_signup_notices(rows: list[dict]) -> str:
             f"- @{handle} joined **#{r.get('game_id')}** "
             f"{format_game_card(when, r.get('spots'), loc)}\n"
             f"  Contact: [IG]({ig_url}) · "
-            f"`{admin_msg_game_cmd(handle, r.get('game_id'), r.get('when_text') or '')}`"
+            f"`{admin_msg_game_cmd(handle, r.get('game_id'), r.get('when_text') or '', r.get('location') or '')}`"
         )
     if len(lines) == 1:
         return ""
@@ -2242,12 +2262,13 @@ def member_leave_game(user: dict, text: str) -> bool:
     prefer: Optional[int] = int(m.group(1)) if m else None
     mine = member_joined_games(handle)
     if not mine:
-        if leave_bare or prefer is not None or re.search(r"\bleave\b|退出", lower):
+        if leave_bare or prefer is not None or re.match(r"^(leave|退出)\b", lower):
             append_assistant(t("leave_none", lang))
             return True
         return False
+    # Only treat explicit leave/cancel (not “cancel my Netflix” mid-chat)
     if prefer is None and not leave_bare:
-        if not re.search(r"\bleave\b|\bcancel\b|退出|唔去", lower):
+        if not re.match(r"^(leave|cancel|quit|退出|唔去)\b", lower):
             return False
     if prefer is None:
         if len(mine) == 1:
@@ -3020,8 +3041,16 @@ def build_daily_admin_digest(*, hours: int = 24) -> str:
             """,
             (since,),
         ).fetchall()
-    login_rows = [_as_dict(r) for r in logins]
-    join_rows = [_as_dict(r) for r in joins]
+    login_rows = [
+        r
+        for r in (_as_dict(x) for x in logins)
+        if normalize_handle(r.get("ig_handle") or "") not in ADMIN_HANDLES
+    ]
+    join_rows = [
+        r
+        for r in (_as_dict(x) for x in joins)
+        if normalize_handle(r.get("ig_handle") or "") not in ADMIN_HANDLES
+    ]
     lines.append(f"LOGINS ({len(login_rows)})")
     if not login_rows:
         lines.append("- (none)")
@@ -3247,7 +3276,9 @@ def consume_day_before_reminders(ig_handle: str) -> str:
                 continue
             when = format_game_when_text(game.get("when_text") or "") or "soon"
             loc = game.get("location") or DEFAULT_GAME_LOCATION
-            when_note = " (today)" if days == 0 else " (tomorrow)"
+            when_note = (
+                t("when_note_today", lang) if days == 0 else t("when_note_tomorrow", lang)
+            )
             lines.append(
                 t(
                     "reminder",
@@ -3333,7 +3364,7 @@ def admin_today_markdown() -> str:
                     if not h or h in ADMIN_HANDLES:
                         continue
                     blocks.append(
-                        f"- @{h} · `{admin_msg_game_cmd(h, g['id'], g.get('when_text') or '')}`"
+                        f"- @{h} · `{admin_msg_game_cmd(h, g['id'], g.get('when_text') or '', g.get('location') or '')}`"
                     )
                     shown += 1
                 if not shown:
@@ -3373,16 +3404,14 @@ def admin_today_markdown() -> str:
             h = normalize_handle(r.get("ig_handle") or "")
             gid = r.get("game_id")
             blocks.append(
-                f"- @{h} → #{gid} · `{admin_msg_game_cmd(h, gid, r.get('when_text') or '')}`"
+                f"- @{h} → #{gid} · "
+                f"`{admin_msg_game_cmd(h, gid, r.get('when_text') or '', r.get('location') or '')}`"
             )
     else:
         blocks.append("**Unread joins** — none")
-    # Compact invite fairness peek
-    fairness = invite_fairness_markdown()
-    if "No invite rolls" not in fairness:
-        blocks.append("\n" + fairness)
-    else:
-        blocks.append("\n_Invite rolls today: none yet — type `invites` anytime._")
+    blocks.append(
+        "\n_Invite fairness: type `invites` for who got in/skipped (score × urgency)._"
+    )
     blocks.append(
         "\n_Shortcuts: `fill #3` · `msg @handle …` · `invites` · `digest` · `as @handle`_"
     )
@@ -3416,26 +3445,28 @@ def render_admin_today_actions() -> Optional[str]:
                 if st.button(f"Fill #{gid}{cold}", key=f"today_fill_{gid}", use_container_width=True):
                     clicked = f"fill #{gid}"
     # Msg buttons for registered players (skip admins), cold games first, max 6
-    msg_targets: list[tuple[str, int, str]] = []
+    msg_targets: list[tuple[str, int, str, str]] = []
     for g in games:
         gid = int(g["id"])
         when_text = g.get("when_text") or ""
+        loc = g.get("location") or ""
         for s in g.get("signups") or []:
             h = normalize_handle(s.get("ig_handle") or "")
             if not h or h in ADMIN_HANDLES:
                 continue
-            if (h, gid, when_text) not in msg_targets:
-                msg_targets.append((h, gid, when_text))
+            key = (h, gid, when_text, loc)
+            if key not in msg_targets:
+                msg_targets.append(key)
             if len(msg_targets) >= 6:
                 break
         if len(msg_targets) >= 6:
             break
     if msg_targets:
         cols = st.columns(min(3, len(msg_targets)))
-        for i, (h, gid, when_text) in enumerate(msg_targets):
+        for i, (h, gid, when_text, loc) in enumerate(msg_targets):
             with cols[i % len(cols)]:
                 if st.button(f"Msg @{h}", key=f"today_msg_{h}_{gid}", use_container_width=True):
-                    clicked = admin_msg_game_cmd(h, gid, when_text)
+                    clicked = admin_msg_game_cmd(h, gid, when_text, loc)
     if clicked:
         st.session_state.pop("_admin_today_actions", None)
     return clicked
@@ -3746,7 +3777,7 @@ def admin_help_text() -> str:
         "- `delete game #3` — remove game + signups\n"
         "- `games` / `signups` / `today` — board, who’s in; Today shows cold-first + fill/msg taps\n"
         "- `invites` / `fairness` — who got invited/skipped today (score × urgency)\n"
-        "- `digest` — email + show daily logins & new joins (also auto once/day on admin open)\n"
+        "- `digest` — preview + email once/day (type `digest force` to resend)\n"
         "- `remove @handle` or `remove @handle from #3` — free a spot\n\n"
         "**Members**\n"
         "- `user @handle` — profile + invite score (admin only)\n"
@@ -3835,11 +3866,17 @@ def try_admin_command(text: str) -> bool:
     if lower in {"invites", "/invites", "fairness", "invite log", "invite fairness"}:
         append_assistant(invite_fairness_markdown())
         return True
-    if lower in {"digest", "/digest", "daily digest", "digest force"}:
-        status, detail = maybe_send_daily_admin_digest(force=True)
+    if lower in {"digest", "/digest", "daily digest", "digest force", "/digest force"}:
+        force = "force" in lower
+        status, detail = maybe_send_daily_admin_digest(force=force)
         body = build_daily_admin_digest(hours=24)
         if status == "sent":
             append_assistant(f"**Daily digest emailed** ✅\n\n```\n{body}\n```")
+        elif status == "skipped":
+            append_assistant(
+                f"**Digest preview** (already emailed today — type `digest force` to resend)\n\n"
+                f"```\n{body}\n```"
+            )
         elif status == "empty_creds":
             append_assistant(
                 f"**Digest preview** (email not configured — {detail})\n\n```\n{body}\n```"
@@ -8666,8 +8703,9 @@ def user_can_be_invited(user: Optional[dict] = None) -> bool:
     u = user or st.session_state.get("user")
     if not u:
         return False
+    # Admins don't need soft invites (they're already on the board)
     if is_admin(u):
-        return True
+        return False
     return invite_score_for_user(u) >= INVITE_ELIGIBLE_MIN
 
 
