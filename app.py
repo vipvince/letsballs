@@ -284,8 +284,8 @@ AVATAR_POOL: list[dict[str, Any]] = [
     {"file": "peak_goat.png", "emoji": "🐐", "label": "peak goat", "tags": ["hike", "mountain", "trail", "climb", "outdoor"]},
     {"file": "runner_horse.png", "emoji": "🐴", "label": "runner horse", "tags": ["run", "runner", "marathon", "sport", "🏃", "cycling", "🚴", "swim", "🏊"]},
     {"file": "party_parrot.png", "emoji": "🦜", "label": "party parrot", "tags": ["party", "fun", "nightlife", "dance", "cocktail", "🍸"]},
-    {"file": "bookworm_owl.png", "emoji": "🦉", "label": "bookworm owl", "tags": ["book", "read", "study", "learn", "writer"]},
-    {"file": "gamer_hamster.png", "emoji": "🐹", "label": "gamer hamster", "tags": ["gamer", "game", "esport", "stream", "twitch"]},
+    {"file": "bookworm_owl.png", "emoji": "🦉", "label": "bookworm owl", "tags": ["bookworm", "book", "reader", "reading", "writer", "novel", "讀書"]},
+    {"file": "gamer_hamster.png", "emoji": "🐹", "label": "gamer hamster", "tags": ["gamer", "gaming", "esport", "twitch"]},
     {"file": "beach_crab.png", "emoji": "🦀", "label": "beach crab", "tags": ["beach", "sea", "island", "vacation", "sand"]},
     {"file": "night_raccoon.png", "emoji": "🦝", "label": "night raccoon", "tags": ["night", "owl", "late", "nightlife", "raccoon"]},
     {"file": "rally_raccoon.png", "emoji": "🦝", "label": "rally raccoon", "tags": ["raccoon", "mischief"]},
@@ -392,13 +392,13 @@ _ALLOWED_NAT_KEYS = (
 )
 FOODIE_CAT_AVATAR = os.path.join(AVATAR_DIR, "foodie_cat.png")
 
-# Emoji → strong avatar boosts (checked in bio / scraped text as-is)
-# Butterfly maps to cat per club taste: pretty + playful → cat portraits
+# Emoji → avatar boosts. Checked against the IG bio / name only (never web crumbs).
+# Keep each rule specific — one theme emoji must not boost unrelated food/drink animals.
 EMOJI_AVATAR_RULES: list[dict[str, Any]] = [
     {
         "emojis": ["🐱", "🐈", "😺", "😸", "😻", "😽", "😹", "🙀", "😿", "😾", "🐈‍⬛"],
         "files": ["fat_cat.png", "foodie_cat.png", "dumpling_cat.png", "crosscourt_cat.png"],
-        "boost": 14,
+        "boost": 16,
         "reason": "cat emoji in bio",
     },
     {
@@ -410,109 +410,171 @@ EMOJI_AVATAR_RULES: list[dict[str, Any]] = [
     {
         "emojis": ["🐶", "🐕", "🐩", "🦮", "🐕‍🦺"],
         "files": ["tennis_pug.png", "surf_dog.png"],
-        "boost": 14,
+        "boost": 16,
         "reason": "dog emoji in bio",
+    },
+    {
+        "emojis": ["🐷", "🐖", "🐗"],
+        "files": ["chef_pig.png"],
+        "boost": 18,
+        "reason": "pig emoji in bio",
+    },
+    {
+        "emojis": ["👩‍🍳", "👨‍🍳", "🍳", "🌶️", "🌶"],
+        "files": ["chef_pig.png"],
+        "boost": 14,
+        "reason": "chef/spice emoji in bio",
+    },
+    {
+        "emojis": ["🍣", "🍜", "🍕", "🍔", "🍲", "🥘"],
+        "files": ["foodie_cat.png", "chef_pig.png", "dumpling_cat.png"],
+        "boost": 12,
+        "reason": "food emoji in bio",
+    },
+    {
+        "emojis": ["🍰", "🧁", "🍩", "🍪"],
+        "files": ["tea_bunny.png", "bakery_mouse.png", "foodie_cat.png"],
+        "boost": 12,
+        "reason": "dessert emoji in bio",
+    },
+    {
+        "emojis": ["☕"],
+        "files": ["coffee_bear.png"],
+        "boost": 14,
+        "reason": "coffee emoji in bio",
+    },
+    {
+        "emojis": ["🍷", "🍸", "🍻", "🥂", "🍹"],
+        "files": ["party_parrot.png", "foodie_cat.png"],
+        "boost": 10,
+        "reason": "drinks emoji in bio",
     },
     {
         "emojis": ["🌎", "🌍", "🌏", "✈️", "🧳", "🗺️"],
         "files": ["travel_camel.png"],
-        "boost": 12,
+        "boost": 14,
         "reason": "travel emoji in bio",
     },
     {
         "emojis": ["🏄", "🏄‍♀️", "🏄‍♂️", "🏖️", "🌊"],
         "files": ["surf_dog.png", "beach_crab.png", "slice_seal.png"],
-        "boost": 10,
+        "boost": 12,
         "reason": "beach/surf emoji in bio",
     },
     {
-        "emojis": ["🏃", "🏃‍♀️", "🏃‍♂️", "🚴", "🚴‍♀️", "🏊", "🏊‍♀️"],
+        "emojis": ["🏃", "🏃‍♀️", "🏃‍♂️", "🚴", "🚴‍♀️", "🚴‍♂️", "🏊", "🏊‍♀️", "🏊‍♂️"],
         "files": ["runner_horse.png"],
-        "boost": 10,
+        "boost": 12,
         "reason": "sport emoji in bio",
     },
     {
-        "emojis": ["🍣", "🍰", "☕", "🍸", "🍜", "🍷", "🌶️", "🌶"],
-        "files": ["foodie_cat.png", "chef_pig.png", "coffee_bear.png", "tea_bunny.png"],
-        "boost": 8,
-        "reason": "food/drink emoji in bio",
+        "emojis": ["🧘", "🧘‍♀️", "🧘‍♂️", "🕉️", "☮️"],
+        "files": ["yoga_goat.png", "court_capybara.png"],
+        "boost": 14,
+        "reason": "yoga/wellness emoji in bio",
     },
     {
-        "emojis": ["🐷", "🐖", "🐗", "👩‍🍳", "👨‍🍳", "🍳"],
-        "files": ["chef_pig.png", "foodie_cat.png"],
-        "boost": 14,
-        "reason": "pig/chef emoji in bio",
+        "emojis": ["⛳", "🏌️", "🏌️‍♀️", "🏌️‍♂️"],
+        "files": ["peak_goat.png", "travel_camel.png"],
+        "boost": 10,
+        "reason": "golf emoji in bio",
+    },
+    {
+        "emojis": ["🎾"],
+        "files": ["crosscourt_cat.png", "tennis_pug.png", "forehand_frog.png"],
+        "boost": 6,
+        "reason": "tennis emoji in bio",
     },
     {
         "emojis": ["🐼"],
         "files": ["sleepy_panda.png"],
-        "boost": 12,
+        "boost": 16,
         "reason": "panda emoji in bio",
     },
     {
         "emojis": ["🐨"],
         "files": ["chill_koala.png"],
-        "boost": 12,
+        "boost": 16,
         "reason": "koala emoji in bio",
     },
     {
         "emojis": ["🦊"],
         "files": ["volley_fox.png"],
-        "boost": 12,
+        "boost": 16,
         "reason": "fox emoji in bio",
     },
     {
         "emojis": ["🐰", "🐇"],
         "files": ["tea_bunny.png", "backhand_bunny.png"],
-        "boost": 12,
+        "boost": 16,
         "reason": "bunny emoji in bio",
     },
     {
         "emojis": ["🐸"],
         "files": ["forehand_frog.png"],
-        "boost": 12,
+        "boost": 16,
         "reason": "frog emoji in bio",
+    },
+    {
+        "emojis": ["🦉"],
+        "files": ["bookworm_owl.png"],
+        "boost": 16,
+        "reason": "owl emoji in bio",
     },
     {
         "emojis": ["📚", "📖"],
         "files": ["bookworm_owl.png"],
-        "boost": 10,
+        "boost": 16,
         "reason": "book emoji in bio",
     },
     {
         "emojis": ["🎮"],
         "files": ["gamer_hamster.png"],
-        "boost": 10,
+        "boost": 14,
         "reason": "gamer emoji in bio",
     },
     {
-        "emojis": ["☕"],
+        "emojis": ["🐪", "🐫"],
+        "files": ["travel_camel.png"],
+        "boost": 16,
+        "reason": "camel emoji in bio",
+    },
+    {
+        "emojis": ["🐻"],
         "files": ["coffee_bear.png"],
-        "boost": 10,
-        "reason": "coffee emoji in bio",
+        "boost": 16,
+        "reason": "bear emoji in bio",
     },
 ]
 
-# Extra bio phrases → avatar file (scored only against the IG bio / name)
+# Bio / name phrases → avatar (whole-word match on the real IG bio only)
 BIO_AVATAR_HINTS: list[tuple[tuple[str, ...], str, str]] = [
-    (("pilates", "yoga", "wellness", "meditation", "mindful"), "yoga_goat.png", "wellness words in bio"),
-    (("hike", "hiking", "trail", "mountain", "outdoors", "outdoor"), "peak_goat.png", "outdoors words in bio"),
-    (("run", "runner", "marathon", "running", "triathlon"), "runner_horse.png", "running words in bio"),
-    (("travel", "traveller", "traveler", "wanderlust", "digital nomad"), "travel_camel.png", "travel words in bio"),
-    (("coffee", "latte", "cafe", "café", "barista"), "coffee_bear.png", "coffee words in bio"),
-    (("chef", "cook", "cooking", "recipe", "foodie", "finedine"), "chef_pig.png", "food words in bio"),
-    (("bakery", "bread", "pastry", "croissant", "bake"), "bakery_mouse.png", "bakery words in bio"),
-    (("tea", "afternoon tea", "matcha"), "tea_bunny.png", "tea words in bio"),
-    (("surf", "surfing", "beach", "ocean"), "surf_dog.png", "beach/surf words in bio"),
-    (("dog", "puppy", "pup", "dog mum", "dog mom", "shiba"), "tennis_pug.png", "dog words in bio"),
-    (("cat", "kitten", "kitty", "meow"), "foodie_cat.png", "cat words in bio"),
-    (("panda",), "sleepy_panda.png", "panda in bio"),
+    (("pilates", "yoga", "wellness", "meditation", "mindful", "瑜伽"), "yoga_goat.png", "wellness words in bio"),
+    (("hike", "hiking", "trail", "mountain", "outdoors", "outdoor", "行山"), "peak_goat.png", "outdoors words in bio"),
+    (("run", "runner", "marathon", "running", "triathlon", "跑步"), "runner_horse.png", "running words in bio"),
+    (("travel", "traveller", "traveler", "wanderlust", "digital nomad", "旅行"), "travel_camel.png", "travel words in bio"),
+    (("coffee", "latte", "cafe", "café", "barista", "咖啡"), "coffee_bear.png", "coffee words in bio"),
+    (("chef", "cook", "cooking", "recipe", "foodie", "finedine", "廚房", "煮"), "chef_pig.png", "food words in bio"),
+    (("bakery", "bread", "pastry", "croissant", "bake", "麵包"), "bakery_mouse.png", "bakery words in bio"),
+    (("tea", "afternoon tea", "matcha", "下午茶"), "tea_bunny.png", "tea words in bio"),
+    (("surf", "surfing", "beach", "ocean", "衝浪"), "surf_dog.png", "beach/surf words in bio"),
+    (("dog", "puppy", "pup", "dog mum", "dog mom", "shiba", "狗"), "tennis_pug.png", "dog words in bio"),
+    (("cat", "kitten", "kitty", "meow", "貓"), "foodie_cat.png", "cat words in bio"),
+    (("panda", "熊貓"), "sleepy_panda.png", "panda in bio"),
     (("koala",), "chill_koala.png", "koala in bio"),
     (("gamer", "gaming", "twitch", "esport"), "gamer_hamster.png", "gamer words in bio"),
-    (("book", "reader", "reading", "writer"), "bookworm_owl.png", "book words in bio"),
-    (("party", "nightlife", "clubbing"), "party_parrot.png", "party words in bio"),
+    (("bookworm", "reader", "reading", "writer", "novel", "讀書"), "bookworm_owl.png", "book words in bio"),
+    (("party", "nightlife", "clubbing", "wine", "cocktail"), "party_parrot.png", "party words in bio"),
     (("swim", "diving", "snorkel"), "slice_seal.png", "swim words in bio"),
     (("frog",), "forehand_frog.png", "frog in bio"),
+    (("golf", "golfer"), "peak_goat.png", "golf words in bio"),
+    (("event", "founder", "entrepreneur", "startup"), "baseline_beaver.png", "founder/work words in bio"),
+    (("dumpling", "dim sum", "dimsum", "點心"), "dumpling_cat.png", "dumpling words in bio"),
+]
+
+# Handle-only specials (not bio) — kept tiny on purpose
+HANDLE_AVATAR_HINTS: list[tuple[tuple[str, ...], str, str]] = [
+    (("vip", "vipvince"), "surf_dog.png", "handle VIP cue"),
 ]
 
 # Auth flow states
@@ -6194,7 +6256,7 @@ def _looks_foodie(text: str) -> bool:
 
 def _keyword_in_text(keyword: str, text: str) -> bool:
     """
-    Whole-word match for ASCII keywords so “book” ≠ Facebook and “recipe” ≠ web noise.
+    Whole-word match for ASCII keywords so “book” ≠ Facebook.
     Emoji / CJK / multi-word phrases still use substring match.
     """
     if not keyword or not text:
@@ -6211,9 +6273,7 @@ def _keyword_in_text(keyword: str, text: str) -> bool:
 
 def _extract_bio_blob(scraped: str, scrape: Optional[dict[str, Any]] = None) -> str:
     """
-    Real IG bio / name / emojis only — never the full scrape blob.
-    Full scrape often contains Facebook / web crumbs that false-trigger keywords
-    (e.g. “book” inside Facebook, “recipe” in unrelated search snippets).
+    Real IG bio / name / emojis only — never the full scrape or web crumbs.
     """
     parts: list[str] = []
     if isinstance(scrape, dict):
@@ -6232,74 +6292,139 @@ def _extract_bio_blob(scraped: str, scrape: Optional[dict[str, Any]] = None) -> 
     m2 = re.search(r'on Instagram:\s*"([^"]+)"', text, re.I)
     if m2:
         parts.append(m2.group(1).strip())
-    return "\n".join(parts)
+    # Dedupe while keeping order
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        key = p.strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return "\n".join(out)
+
+
+def _prune_emoji_hits(hits: list[str]) -> list[str]:
+    """Drop base glyphs already covered by a ZWJ sequence (🍳 inside 👩‍🍳)."""
+    pruned: list[str] = []
+    for em in hits:
+        if any(em != other and em in other for other in hits):
+            continue
+        pruned.append(em)
+    return pruned or hits
 
 
 def _score_avatar(
     pool_item: dict[str, Any],
-    blob_lower: str,
-    raw_text: str,
     *,
-    bio_lower: str = "",
-    bio_raw: str = "",
+    bio_lower: str,
+    bio_raw: str,
+    handle: str = "",
 ) -> tuple[int, list[str]]:
-    """Return (score, evidence bullets)."""
+    """
+    Score one avatar against the member's real IG bio.
+    Priority: animal emoji → theme emoji → bio phrases → bio tags → handle cues.
+    Web / Facebook scrape text is intentionally ignored.
+    """
     score = 0
     evidence: list[str] = []
     file_name = pool_item["file"]
     bio_l = bio_lower or ""
-    # Emoji / strong bio signals only from the real bio — not web/Facebook crumbs
-    emoji_haystack = bio_raw or raw_text or ""
+    bio = bio_raw or ""
+    handle_l = (handle or "").lower()
 
-    # Emoji rules get priority (skip base parts already covered by a ZWJ emoji, e.g. 🍳 inside 👩‍🍳)
+    # 1) Avatar's own emoji appears in the bio (strongest animal cue)
+    own_emoji = str(pool_item.get("emoji") or "")
+    if own_emoji and own_emoji in bio:
+        score += 20
+        evidence.append(f"bio has {own_emoji} → {pool_item.get('label')} (+20)")
+
+    # 2) Theme emoji rules (bio only)
     for rule in EMOJI_AVATAR_RULES:
-        hit = [em for em in rule["emojis"] if em in emoji_haystack]
-        if not hit:
+        hit = [em for em in rule["emojis"] if em in bio]
+        if not hit or file_name not in rule["files"]:
             continue
-        pruned: list[str] = []
-        for em in hit:
-            if any(em != other and em in other for other in hit):
-                continue
-            pruned.append(em)
-        hit = pruned or hit
-        if file_name in rule["files"]:
-            score += int(rule["boost"])
-            evidence.append(f"emoji {''.join(hit)} → {rule['reason']} (+{rule['boost']})")
+        hit = _prune_emoji_hits(hit)
+        boost = int(rule["boost"])
+        score += boost
+        evidence.append(f"emoji {''.join(hit)} → {rule['reason']} (+{boost})")
 
-    # Strong bio-phrase hints (actual bio / name only)
+    # 3) Bio phrase hints (whole-word, bio only)
     for keywords, fname, reason in BIO_AVATAR_HINTS:
         if fname != file_name:
             continue
-        hit_kw = next((kw for kw in keywords if _keyword_in_text(kw, bio_l)), None)
+        hit_kw = next((kw for kw in keywords if _keyword_in_text(kw, bio_l) or kw in bio), None)
         if hit_kw:
             score += 12
             evidence.append(f"bio “{hit_kw}” → {reason} (+12)")
             break
 
+    # 4) Pool tags against bio only (never web blob)
     for tag in pool_item.get("tags") or []:
-        # Emoji tags must match exactly in bio; word tags use whole-word match
-        if len(tag) <= 2 and not tag.isascii():
-            # short CJK
-            if tag in emoji_haystack or _keyword_in_text(tag, bio_l):
-                bump = 5 if _keyword_in_text(tag, bio_l) or tag in emoji_haystack else 3
+        tag_s = str(tag)
+        if not tag_s.isascii() or any(ord(c) > 127 for c in tag_s):
+            # emoji / CJK tags
+            if tag_s in bio or _keyword_in_text(tag_s, bio_l):
+                bump = 5
                 score += bump
-                evidence.append(f"keyword “{tag}” (+{bump})")
-        elif tag in emoji_haystack:  # emoji tag
-            score += 3
-            evidence.append(f"tag “{tag}”")
-        elif _keyword_in_text(tag, bio_l):
-            bump = 6 if len(tag) > 3 else 4
+                evidence.append(f"bio tag “{tag_s}” (+{bump})")
+        elif _keyword_in_text(tag_s, bio_l):
+            # Skip ultra-generic English tags that create noise
+            if tag_s.lower() in {
+                "fun", "cute", "pink", "work", "sea", "sport", "music",
+                "vibe", "unique", "energy", "watch", "alert", "friend",
+                "learn", "study", "game", "stream", "color", "green",
+                "slow", "late", "night", "weekend", "drama", "sly",
+                "clever", "steady", "builder", "playful", "fluffy",
+                "mischief", "quack", "nut", "fly", "reef", "river",
+                "vip",  # handle-only
+            }:
+                continue
+            bump = 6 if len(tag_s) > 3 else 4
             score += bump
-            evidence.append(f"bio tag “{tag}” (+{bump})")
-        elif _keyword_in_text(tag, blob_lower):
-            # Weak: full scrape / handle only — never treat as a “bio” hit
-            bump = 2 if len(tag) > 3 else 1
-            score += bump
-            evidence.append(f"keyword “{tag}” (+{bump})")
+            evidence.append(f"bio tag “{tag_s}” (+{bump})")
 
-    # Deduplicate evidence while keeping order
+    # 5) Handle-only specials (vip etc.)
+    for keywords, fname, reason in HANDLE_AVATAR_HINTS:
+        if fname != file_name:
+            continue
+        hit_kw = next((kw for kw in keywords if kw.lower() in handle_l), None)
+        if hit_kw:
+            score += 8
+            evidence.append(f"handle “{hit_kw}” → {reason} (+8)")
+            break
+
+    # Foodie cat bonus when bio is clearly cat + food
+    if file_name == "foodie_cat.png" and _looks_foodie(bio_l):
+        if any(_keyword_in_text(k, bio_l) or k in bio for k in ("cat", "貓", "🐱", "🐈")):
+            score += 4
+            evidence.append("bio cat + foodie combo (+4)")
+
     evidence = list(dict.fromkeys(evidence))
     return score, evidence
+
+
+def _pick_reason(evidence: list[str], label: str, bio_lower: str) -> str:
+    """Human reason from the strongest evidence line."""
+    if not evidence:
+        return f"best available fit for “{label}”"
+
+    def _boost(line: str) -> int:
+        m = re.search(r"\(\+(\d+)\)\s*$", line)
+        return int(m.group(1)) if m else 0
+
+    ranked = sorted(evidence, key=_boost, reverse=True)
+    top = ranked[0]
+    # "bio has 🐷 → chef pig (+20)" → "🐷 in bio"
+    m_own = re.match(r"bio has (.+?) →", top)
+    if m_own:
+        return f"{m_own.group(1).strip()} in bio"
+    if "→" in top:
+        return re.sub(r"\s*\(\+\d+\)\s*$", "", top.split("→", 1)[-1]).strip()
+    if top.startswith("bio “") or top.startswith("bio tag"):
+        return f"bio fit for “{label}”"
+    if any(t in bio_lower for t in ("cat", "貓")) and _looks_foodie(bio_lower):
+        return "cat lover + foodie keywords in bio"
+    return f"best bio fit for “{label}”"
 
 
 def _match_avatar_from_profile(
@@ -6307,12 +6432,9 @@ def _match_avatar_from_profile(
     handle: str,
     scrape: Optional[dict[str, Any]] = None,
 ) -> tuple[dict[str, Any], int, str, list[str]]:
-    """Pick a pre-generated avatar; return avatar, score, reason, evidence list."""
-    raw = scraped or ""
-    bio_blob = _extract_bio_blob(raw, scrape)
+    """Pick the most relevant avatar from the member's IG bio."""
+    bio_blob = _extract_bio_blob(scraped or "", scrape)
     bio_lower = bio_blob.lower()
-    # Full scrape only for weak keyword fallback — bio hints never see this
-    blob = f"{bio_blob}\n{raw}\n{handle}".lower()
     available = [p for p in AVATAR_POOL if os.path.isfile(os.path.join(AVATAR_DIR, p["file"]))]
     if not available:
         available = list(AVATAR_POOL)
@@ -6320,7 +6442,7 @@ def _match_avatar_from_profile(
     scored: list[tuple[int, dict[str, Any], list[str]]] = []
     for p in available:
         sc, ev = _score_avatar(
-            p, blob, raw, bio_lower=bio_lower, bio_raw=bio_blob
+            p, bio_lower=bio_lower, bio_raw=bio_blob, handle=handle
         )
         scored.append((sc, p, ev))
     scored.sort(key=lambda x: (-x[0], x[1]["file"]))
@@ -6330,39 +6452,28 @@ def _match_avatar_from_profile(
         best = available[abs(hash(handle)) % len(available)]
         best_score = 0
         reason = "wildcard pick (no strong bio/emoji signal)"
-        evidence = ["no keyword/emoji hits — hashed handle into the pool"]
+        evidence = ["no keyword/emoji hits in bio — hashed handle into the pool"]
         return best, best_score, reason, evidence
 
-    # Prefer cat portraits hard when cat/butterfly emoji present
-    cat_emoji_hit = any(em in raw for em in ["🐱", "🐈", "😺", "😸", "😻", "🦋", "🐈‍⬛"])
-    if cat_emoji_hit and best["file"] not in {
-        "fat_cat.png", "foodie_cat.png", "dumpling_cat.png", "crosscourt_cat.png"
-    }:
+    # Hard prefer a cat when the bio itself shows cat/butterfly emoji
+    cat_files = {"fat_cat.png", "foodie_cat.png", "dumpling_cat.png", "crosscourt_cat.png"}
+    cat_emoji_hit = any(
+        em in bio_blob for em in ["🐱", "🐈", "😺", "😸", "😻", "🦋", "🐈‍⬛"]
+    )
+    if cat_emoji_hit and best["file"] not in cat_files:
         for sc, p, ev in scored:
-            if p["file"] in {"fat_cat.png", "foodie_cat.png", "dumpling_cat.png", "crosscourt_cat.png"} and sc > 0:
+            if p["file"] in cat_files and sc > 0:
                 best, best_score, evidence = p, sc, ev
                 break
 
-    if any("bio" in e.lower() for e in evidence):
-        reason = next(
-            (re.sub(r"\s*\(\+\d+\)\s*$", "", e.split("→", 1)[-1]).strip() for e in evidence if "bio" in e.lower()),
-            f"bio fit for “{best['label']}”",
-        )
-    elif any("emoji" in e for e in evidence):
-        # Prefer the strongest emoji signal (highest +N), not whichever fired first
-        def _emoji_boost(line: str) -> int:
-            m = re.search(r"\(\+(\d+)\)\s*$", line)
-            return int(m.group(1)) if m else 0
+    # Hard prefer pig when bio shows pig emoji (even if foodie_cat also scored)
+    if "🐷" in bio_blob or "🐖" in bio_blob:
+        for sc, p, ev in scored:
+            if p["file"] == "chef_pig.png" and sc > 0:
+                best, best_score, evidence = p, sc, ev
+                break
 
-        top = max((e for e in evidence if "emoji" in e), key=_emoji_boost)
-        reason = re.sub(r"\s*\(\+\d+\)\s*$", "", top.split("→", 1)[-1]).strip()
-    elif any(t in bio_lower for t in ("cat", "貓")) and _looks_foodie(bio_lower):
-        reason = "cat lover + foodie keywords in bio"
-    elif any(t in bio_lower for t in ("travel", "traveller", "旅")):
-        reason = "travel keywords in bio"
-    else:
-        reason = f"best keyword fit for “{best['label']}”"
-
+    reason = _pick_reason(evidence, best.get("label") or best["file"], bio_lower)
     return best, best_score, reason, evidence[:8]
 
 
@@ -6441,15 +6552,15 @@ def assign_animal_and_vibe(
     scrape: Optional[dict[str, Any]] = None,
 ) -> tuple[str, str, str, str, str]:
     """
-    Fast local assign from the pre-generated 40-photo pool.
+    Assign from the avatar pool using the member's IG bio / name / emojis.
+    Web crumbs and vision blobs are not used for matching (too noisy).
     Returns (display_name, vibe, emoji, mascot_label, avatar_path).
     """
     handle = normalize_handle(ig_handle)
     bio_nick = _bio_nickname_from_scraped(scraped)
-    vision = (scrape or {}).get("vision") if isinstance((scrape or {}).get("vision"), dict) else {}
-    photo_blob = str((vision or {}).get("match_blob") or "")
+    # Match on scrape fields + biography text only — do not feed vision/web blobs in
     avatar, score, reason, evidence = _match_avatar_from_profile(
-        f"{scraped}\n{photo_blob}".strip(),
+        scraped or "",
         handle,
         scrape=scrape,
     )
