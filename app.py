@@ -107,6 +107,8 @@ INVITE_RAND_HIGH = 1.2
 GAMES_CACHE_SECONDS = 120
 GITHUB_MEDIA_BASE = "https://raw.githubusercontent.com/vipvince/letsballs/main"
 WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LqLATzTW38oEUKIcXxXiDw?s=cl&p=i&mlu=4&ilr=4"
+THREADS_CARD_TTL_SEC = 6 * 60 * 60  # keep Threads public cards warm for 6h
+THREADS_CARD_MISS_TTL_SEC = 15 * 60  # short negative cache so we retry misses
 CHARACTER_HERO_MAX_PX = 560
 
 _GAME_TIME_RE = re.compile(
@@ -754,6 +756,7 @@ _COPY_EN: dict[str, str] = {
     "tips": (
         "**Quick tips**\n\n"
         "- **Games** — see upcoming sessions when they appear for you\n"
+        "- **Mine** / `my games` — sessions you’ve already joined\n"
         "- **Join** — type `join` to pick a game, or `join #4` / `join Oct 10 11am`\n"
         "- Ask about racquets, weather, courts — tennis talk is welcome\n"
         "- Type `logout` to switch accounts\n"
@@ -768,16 +771,19 @@ _COPY_EN: dict[str, str] = {
     "join_full": "**{label}** @ {loc} is full.",
     "join_already": (
         "You’re already in for **{label}** @ {loc}.\n\n"
-        "For logistics (court, timing, who’s coming), {wa}."
+        "For logistics (court, timing, who’s coming):\n{wa}"
     ),
     "join_ok": (
         "You’re in for **{label}** @ {loc}.\n\n"
-        "Tap in for logistics — court updates and who’s coming:\n{wa}"
+        "WhatsApp for logistics — court updates and who’s coming:\n{wa}"
     ),
+    "my_games_none": "You’re not signed up for an upcoming game yet. Type `games` to see what’s open.",
+    "my_games_header": "**Your games**",
+    "opener_your_games": "Here’s what you’re down for:",
     "join_which": (
-        "想入邊場？\n\n"
+        "Which game do you want?\n\n"
         "{options}\n\n"
-        "回覆例如 `join #4` 或 `join Oct 10 11am` — 或者撓下面 Join 握。"
+        "Reply e.g. `join #4` or `join Oct 10 11am` — or tap Join below."
     ),
     "persona_1": "Back on court, **{animal}** {emoji}",
     "persona_2": "**{animal}** {emoji} is ready — let’s play.",
@@ -788,7 +794,8 @@ _COPY_EN: dict[str, str] = {
     "signup_ok": "Ask about games, spots, or courts.",
     "logged_out": "Logged out. Drop an IG handle when you’re ready.",
     "reminder": (
-        "Reminder — you’re down for **#{gid} · {when}** @ {loc} tomorrow. "
+        "Reminder — you’re down for **#{gid} · {when}** @ {loc}{when_note}.\n"
+        "WhatsApp logistics: {wa}\n"
         "See you on court 🎾"
     ),
     "heads_up": "**Heads up**",
@@ -805,6 +812,7 @@ _COPY_YUE: dict[str, str] = {
     "tips": (
         "**小提示**\n\n"
         "- **Games** — 睇吓有咩場（有排期先會出現）\n"
+        "- **Mine** / `my games` — 你已報名嘅場\n"
         "- **Join** — 打 `join` 揀場，或 `join #4` / `join Oct 10 11am`\n"
         "- 球拍、天氣、球場都可以傾\n"
         "- 打 `logout` 換帳號\n"
@@ -816,12 +824,15 @@ _COPY_YUE: dict[str, str] = {
     "join_full": "**{label}** @ {loc} 已經滿咗。",
     "join_already": (
         "你已經入咗 **{label}** @ {loc}。\n\n"
-        "場地／時間／邊個嚟：{wa}"
+        "場地／時間／邊個嚟：\n{wa}"
     ),
     "join_ok": (
         "搞掂 — 你入咗 **{label}** @ {loc}。\n\n"
-        "物流同更新喺呢度：\n{wa}"
+        "WhatsApp 物流／更新：\n{wa}"
     ),
+    "my_games_none": "你未報名即將嚟嘅場。打 `games` 睇吓有咩開放。",
+    "my_games_header": "**你嘅場次**",
+    "opener_your_games": "你報咗呢啲場：",
     "join_which": (
         "想入邊場？\n\n"
         "{options}\n\n"
@@ -836,7 +847,8 @@ _COPY_YUE: dict[str, str] = {
     "signup_ok": "想問場次、名額定球場都可以。",
     "logged_out": "已登出。準備好再丟 IG handle 畀我。",
     "reminder": (
-        "提提你 — 你聽日有場 **#{gid} · {when}** @ {loc}。"
+        "提提你 — 你有場 **#{gid} · {when}** @ {loc}{when_note}。\n"
+        "WhatsApp：{wa}\n"
         "球場見 🎾"
     ),
     "heads_up": "**提提你**",
@@ -2024,8 +2036,8 @@ def member_tips_text(user: Optional[dict] = None) -> str:
     return t("tips", user_lang(user))
 
 
-def list_game_signups() -> list[dict]:
-    """Upcoming games with signup handles, soonest first."""
+def list_game_signups(*, cold_first: bool = False) -> list[dict]:
+    """Upcoming games with signup handles, soonest first (optional cold-first)."""
     with get_conn() as conn:
         conn.execute(
             """
@@ -2064,7 +2076,61 @@ def list_game_signups() -> list[dict]:
                     "signups": [_as_dict(r) for r in rows],
                 }
             )
-    return sort_games_chronologically(out)
+    out = sort_games_chronologically(out)
+    if cold_first:
+        out.sort(
+            key=lambda g: (
+                0 if game_is_cold(g) and int(g.get("spots") or 0) > 0 else 1,
+                game_when_datetime(g) or datetime.max,
+                int(g.get("id") or 0),
+            )
+        )
+    return out
+
+
+def member_joined_games(ig_handle: str) -> list[dict]:
+    """Upcoming games this member has already joined, soonest first."""
+    handle = normalize_handle(ig_handle)
+    if not handle:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT g.id, g.when_text, g.location, g.spots, g.notes, g.created_at
+            FROM games g
+            JOIN game_signups s ON s.game_id = g.id
+            WHERE lower(s.ig_handle) = ?
+            """,
+            (handle,),
+        ).fetchall()
+    games = [_as_dict(r) for r in rows]
+    games = [g for g in games if game_is_upcoming(g)]
+    return sort_games_chronologically(games)
+
+
+def member_my_games_markdown(user: Optional[dict] = None) -> str:
+    """Member-facing list of games they’ve joined."""
+    u = user or st.session_state.get("user") or {}
+    lang = user_lang(u)
+    games = member_joined_games(u.get("ig_handle") or "")
+    if not games:
+        return t("my_games_none", lang)
+    blocks = [t("my_games_header", lang)]
+    for g in games:
+        when = format_game_when_text(g.get("when_text") or "") or "TBD"
+        loc = g.get("location") or DEFAULT_GAME_LOCATION
+        blocks.append(f"- **#{g['id']}** · {when} · {loc}")
+    blocks.append(f"\nWhatsApp: [join group]({WHATSAPP_GROUP_URL})")
+    blocks.append(f"Copy link: `{WHATSAPP_GROUP_URL}`")
+    return "\n".join(blocks)
+
+
+def whatsapp_link_block() -> str:
+    """Markdown link + copyable URL for join replies / reminders."""
+    return (
+        f"[Join the WhatsApp group]({WHATSAPP_GROUP_URL})\n"
+        f"Copy link: `{WHATSAPP_GROUP_URL}`"
+    )
 
 
 def signups_as_context() -> str:
@@ -2805,14 +2871,19 @@ def consume_member_dms(ig_handle: str) -> str:
 
 
 def consume_day_before_reminders(ig_handle: str) -> str:
-    """In-app reminder the day before a signed-up game."""
+    """
+    In-app reminder for games tomorrow OR today (HK time).
+    Fires once per game per window (day-before / day-of) so members who
+    miss the day-before still get a same-day nudge.
+    """
     handle = normalize_handle(ig_handle)
     if not handle:
         return ""
     now = hk_now()
-    tomorrow = (now + timedelta(days=1)).date()
-    remind_key = tomorrow.isoformat()
+    today = now.date()
     lines: list[str] = []
+    lang = user_lang(get_user_by_handle(handle))
+    wa = whatsapp_link_block()
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -2826,8 +2897,16 @@ def consume_day_before_reminders(ig_handle: str) -> str:
         for r in rows:
             game = _as_dict(r)
             dt = game_when_datetime(game, now=now)
-            if dt is None or dt.date() != tomorrow:
+            if dt is None:
                 continue
+            # Skip games that already started
+            if dt < now:
+                continue
+            days = (dt.date() - today).days
+            if days not in (0, 1):
+                continue
+            kind = "dayof" if days == 0 else "daybefore"
+            remind_key = f"{dt.date().isoformat()}:{kind}"
             prior = conn.execute(
                 """
                 SELECT id FROM game_reminders
@@ -2837,15 +2916,18 @@ def consume_day_before_reminders(ig_handle: str) -> str:
             ).fetchone()
             if prior:
                 continue
-            when = format_game_when_text(game.get("when_text") or "") or "tomorrow"
+            when = format_game_when_text(game.get("when_text") or "") or "soon"
             loc = game.get("location") or DEFAULT_GAME_LOCATION
+            when_note = " (today)" if days == 0 else " (tomorrow)"
             lines.append(
                 t(
                     "reminder",
-                    user_lang(get_user_by_handle(handle)),
+                    lang,
                     gid=game["id"],
                     when=when,
                     loc=loc,
+                    when_note=when_note,
+                    wa=wa,
                 )
             )
             try:
@@ -2860,16 +2942,17 @@ def consume_day_before_reminders(ig_handle: str) -> str:
                 pass
     if not lines:
         return ""
-    head = t("heads_up", user_lang(get_user_by_handle(handle)))
+    head = t("heads_up", lang)
     return head + "\n\n" + "\n\n".join(lines)
 
 
-def member_inbox_bits(ig_handle: str) -> str:
-    """DMs + day-before reminders for a member."""
+def member_inbox_bits(ig_handle: str, *, include_dms: bool = True) -> str:
+    """DMs + game reminders for a member."""
     parts = []
-    dms = consume_member_dms(ig_handle)
-    if dms:
-        parts.append(dms)
+    if include_dms:
+        dms = consume_member_dms(ig_handle)
+        if dms:
+            parts.append(dms)
     rem = consume_day_before_reminders(ig_handle)
     if rem:
         parts.append(rem)
@@ -2889,10 +2972,10 @@ def persona_line(user: dict) -> tuple[str, Optional[str]]:
 
 
 def admin_today_markdown() -> str:
-    """Compact admin ops board for chat — games, subscribers, invite stats."""
-    games = list_game_signups()
+    """Compact admin ops board for chat — cold games first, fill/msg shortcuts."""
+    games = list_game_signups(cold_first=True)
     today = _today_str()
-    blocks = ["**Today · admin dashboard**"]
+    blocks = ["**Today · admin dashboard**", "_Cold games first · tap buttons below or type shortcuts_"]
     if not games:
         blocks.append("_No upcoming games on the board._")
     else:
@@ -2903,17 +2986,25 @@ def admin_today_markdown() -> str:
             try:
                 spots = int(g.get("spots") or 0)
             except (TypeError, ValueError):
-                spots = g.get("spots")
+                spots = 0
             people = g.get("signups") or []
             signed = len(people)
-            cold = " · **COLD**" if game_is_cold(g) and int(spots or 0) > 0 else ""
+            cold = game_is_cold(g) and spots > 0
+            cold_bit = " · **COLD**" if cold else ""
             blocks.append(
                 f"\n**#{g['id']}** · {when}  \n"
-                f"📍 {loc} — **{signed} in** · {spots} open{cold}"
+                f"📍 {loc} — **{signed} in** · {spots} open{cold_bit}"
             )
+            if spots > 0:
+                blocks.append(f"→ `fill #{g['id']}`")
             if people:
                 for s in people:
-                    blocks.append(f"- @{s.get('ig_handle')}")
+                    h = normalize_handle(s.get("ig_handle") or "")
+                    if not h:
+                        continue
+                    blocks.append(
+                        f"- @{h} · `msg @{h} hey — still good for #{g['id']}?`"
+                    )
             else:
                 blocks.append("- _(nobody subscribed yet)_")
     with get_conn() as conn:
@@ -2940,13 +3031,64 @@ def admin_today_markdown() -> str:
     if pending:
         blocks.append(f"**Unread joins** — {len(pending)}")
         for r in pending[:8]:
+            h = normalize_handle(r.get("ig_handle") or "")
+            gid = r.get("game_id")
             blocks.append(
-                f"- @{r.get('ig_handle')} → #{r.get('game_id')}"
+                f"- @{h} → #{gid} · `msg @{h} hey — still good for #{gid}?`"
             )
     else:
         blocks.append("**Unread joins** — none")
-    blocks.append("\n_Shortcuts: `games` · `signups` · `msg @handle …` · `as @handle`_")
+    blocks.append("\n_Shortcuts: `fill #3` · `msg @handle …` · `as @handle` · `games`_")
     return "\n".join(blocks)
+
+
+def render_admin_today_actions() -> Optional[str]:
+    """
+    One-tap Fill / Msg buttons after Today is shown.
+    Returns a chat command string when a button is clicked.
+    """
+    if not st.session_state.get("_admin_today_actions"):
+        return None
+    user = st.session_state.get("user")
+    if not user or not is_admin(user) or is_impersonating():
+        return None
+
+    games = list_game_signups(cold_first=True)
+    if not games:
+        return None
+
+    clicked: Optional[str] = None
+    st.caption("Quick actions")
+    fill_targets = [g for g in games if int(g.get("spots") or 0) > 0][:4]
+    if fill_targets:
+        cols = st.columns(len(fill_targets))
+        for col, g in zip(cols, fill_targets):
+            gid = int(g["id"])
+            cold = " COLD" if game_is_cold(g) else ""
+            with col:
+                if st.button(f"Fill #{gid}{cold}", key=f"today_fill_{gid}", use_container_width=True):
+                    clicked = f"fill #{gid}"
+    # Msg buttons for registered players (cold games first), max 6
+    msg_targets: list[tuple[str, int]] = []
+    for g in games:
+        gid = int(g["id"])
+        for s in g.get("signups") or []:
+            h = normalize_handle(s.get("ig_handle") or "")
+            if h and (h, gid) not in msg_targets:
+                msg_targets.append((h, gid))
+            if len(msg_targets) >= 6:
+                break
+        if len(msg_targets) >= 6:
+            break
+    if msg_targets:
+        cols = st.columns(min(3, len(msg_targets)))
+        for i, (h, gid) in enumerate(msg_targets):
+            with cols[i % len(cols)]:
+                if st.button(f"Msg @{h}", key=f"today_msg_{h}_{gid}", use_container_width=True):
+                    clicked = f"msg @{h} hey — still good for #{gid}?"
+    if clicked:
+        st.session_state.pop("_admin_today_actions", None)
+    return clicked
 
 
 def game_join_reply(status: str, game: dict, user: Optional[dict] = None) -> str:
@@ -2954,7 +3096,7 @@ def game_join_reply(status: str, game: dict, user: Optional[dict] = None) -> str
     loc = (game or {}).get("location") or DEFAULT_GAME_LOCATION
     gid = (game or {}).get("id")
     label = f"#{gid} · {when}" if gid is not None else when
-    wa = f"[Join the WhatsApp group]({WHATSAPP_GROUP_URL})"
+    wa = whatsapp_link_block()
     lang = user_lang(user)
     if status == "none":
         return t("join_none", lang)
@@ -3252,7 +3394,7 @@ def admin_help_text() -> str:
         f"(format **Sept 26 (Saturday) @ 5pm**, default **{DEFAULT_GAME_LOCATION}**)\n"
         "- `full game #3` / `spots #3 2` — fill headcount or set open spots\n"
         "- `delete game #3` — remove game + signups\n"
-        "- `games` / `signups` / `today` — board, who’s in, mini dashboard\n"
+        "- `games` / `signups` / `today` — board, who’s in; Today shows cold-first + fill/msg taps\n"
         "- `remove @handle` or `remove @handle from #3` — free a spot\n\n"
         "**Members**\n"
         "- `user @handle` — profile + invite score (admin only)\n"
@@ -3336,6 +3478,7 @@ def try_admin_command(text: str) -> bool:
         return True
     if lower in {"today", "dash", "dashboard", "/today", "ops"}:
         append_assistant(admin_today_markdown())
+        st.session_state["_admin_today_actions"] = True
         return True
     # Impersonation exit — also reachable while testing a member (see handle_logged_in)
     if lower in {"back", "unimpersonate", "as me", "stop as", "stop impersonating"}:
@@ -3881,7 +4024,8 @@ def _chrome_get(url: str, headers: Optional[dict] = None, timeout: int = 20):
     return requests.get(url, headers=hdrs, timeout=timeout, allow_redirects=True)
 
 
-_THREADS_CARD_CACHE: dict[str, dict[str, Any]] = {}
+# handle -> (expires_at_epoch, card_dict)
+_THREADS_CARD_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def _threads_profile_card(handle: str) -> dict[str, Any]:
@@ -3889,6 +4033,7 @@ def _threads_profile_card(handle: str) -> dict[str, Any]:
     Public Threads card for the same IG handle.
     Instagram HTML is usually a login wall; Indown's DP form often returns an empty page.
     Threads still embeds full_name / biography / follower_count / profile_pic_url.
+    Cached for THREADS_CARD_TTL_SEC (misses shorter) to speed repeat signups / lookups.
     """
     handle = normalize_handle(handle)
     empty: dict[str, Any] = {
@@ -3902,9 +4047,10 @@ def _threads_profile_card(handle: str) -> dict[str, Any]:
     }
     if not handle:
         return empty
+    now_ts = time.time()
     cached = _THREADS_CARD_CACHE.get(handle)
-    if cached:
-        return cached
+    if cached and cached[0] > now_ts:
+        return cached[1]
 
     text = ""
     for host in ("www.threads.net", "www.threads.com"):
@@ -3927,11 +4073,13 @@ def _threads_profile_card(handle: str) -> dict[str, Any]:
         ):
             break
     if not text:
+        _THREADS_CARD_CACHE[handle] = (now_ts + THREADS_CARD_MISS_TTL_SEC, empty)
         return empty
 
     username_m = re.search(r'"username"\s*:\s*"([^"]+)"', text)
     if not username_m or normalize_handle(username_m.group(1)) != handle:
         # Missing / login-wall Threads pages have no matching username blob.
+        _THREADS_CARD_CACHE[handle] = (now_ts + THREADS_CARD_MISS_TTL_SEC, empty)
         return empty
 
     def _json_str(raw: str) -> str:
@@ -4011,7 +4159,8 @@ def _threads_profile_card(handle: str) -> dict[str, Any]:
         "biography": bio,
         "followers": followers,
     }
-    _THREADS_CARD_CACHE[handle] = out
+    ttl = THREADS_CARD_TTL_SEC if out["ok"] else THREADS_CARD_MISS_TTL_SEC
+    _THREADS_CARD_CACHE[handle] = (now_ts + ttl, out)
     return out
 
 
@@ -5485,6 +5634,16 @@ def scrape_instagram_bio(
         if web.get("text"):
             result["text"] = f"{result['text']} | web:{web['text']}"[:2400]
 
+    # Fast path: Threads public card (cached) — skip heavy IG HTML / Playwright when enough
+    result = _merge_threads_card(result, handle)
+    if _profile_card_seen(result) and result.get("ig_photo_path"):
+        result["emojis"] = _extract_profile_emojis(
+            (result.get("text") or "") + " " + " ".join(result.get("fields") or [])
+        )
+        result["status"] = result.get("status") or "threads_fast"
+        result["note"] = (result.get("note") or "") + " Fast path: Threads card (skipped Playwright)."
+        return result
+
     attempts = (
         ("mobile", _MOBILE_UA),
         ("desktop", _DESKTOP_UA),
@@ -5697,15 +5856,16 @@ def scrape_instagram_bio(
         elif api.get("ok"):
             result["note"] = (result.get("note") or "") + " IG API had no downloadable profile photo."
 
-    # Logged-out desktop Instagram still shows the header photo on private accounts.
-    # Threads often substitutes the gray silhouette for those, so that is not a reason to stop.
-    if need_browser or (
-        not result.get("ig_photo_path")
-        and USE_BROWSER_IG
-    ) or (
-        not result.get("ig_feed_paths")
-        and result.get("visibility") != "private"
-        and USE_BROWSER_IG
+    # Playwright only when we still lack a usable public card / photo
+    have_card = _profile_card_seen(result) and bool(result.get("ig_photo_path"))
+    if USE_BROWSER_IG and not have_card and (
+        need_browser
+        or not result.get("ig_photo_path")
+        or (
+            not result.get("ig_feed_paths")
+            and result.get("visibility") != "private"
+            and not _profile_card_seen(result)
+        )
     ):
         browser = scrape_instagram_via_browser(handle)
         result = _merge_browser_into_scrape(result, browser, handle)
@@ -7912,14 +8072,27 @@ def infer_demographics(
 
 def resolve_member_profile(handle: str) -> dict[str, Any]:
     """
-    Full onboarding research pipeline:
-      1) Web search + DeepSeek (KOL / gender / locale)
-      2) IG scrape (public HD+3 feed / private low-res)
+    Onboarding research pipeline (lazy where possible):
+      1) Threads/IG scrape first (fast path when Threads card is enough)
+      2) Web/LLM research only if scrape is thin or demographics need help
       3) Demographics fusion
     """
     handle = normalize_handle(handle)
-    research = research_handle_before_ig(handle)
-    scrape = scrape_instagram_bio(handle, pre_web=research, skip_web=True)
+    # Scrape first — Threads cache often makes this cheap
+    scrape = scrape_instagram_bio(handle, skip_web=True)
+    card_ok = _profile_card_seen(scrape)
+    research: dict[str, Any] = {}
+    # Skip expensive web+LLM when we already have a solid public card + photo
+    if not card_ok or not scrape.get("ig_photo_path"):
+        research = research_handle_before_ig(handle)
+        if research:
+            scrape["web_research"] = research
+            web = research.get("web") if isinstance(research.get("web"), dict) else research
+            scrape["web_search"] = web
+            if isinstance(web, dict) and web.get("text"):
+                scrape["text"] = f"{scrape.get('text') or ''} | web:{web['text']}"[:2400]
+    else:
+        research = {"ok": False, "note": "skipped web research — Threads/IG card was enough"}
     scraped = scrape.get("text") or f"instagram_handle:{handle}"
     demo = infer_demographics(
         scraped,
@@ -10182,8 +10355,13 @@ def run_quick_action(action: str) -> None:
         append_user("Today", avatar=avatar)
         if is_admin(user) and not is_impersonating():
             append_assistant(admin_today_markdown())
+            st.session_state["_admin_today_actions"] = True
         else:
             append_assistant("Admin dashboard only — type `back` if you’re testing a member.")
+        return
+    if key in {"mine", "my_games"}:
+        append_user("My games", avatar=avatar)
+        append_assistant(member_my_games_markdown(user))
         return
     if key in {"help", "tips"}:
         append_user("Help" if is_admin(user) else "Tips", avatar=avatar)
@@ -10219,6 +10397,8 @@ def render_quick_actions() -> Optional[str]:
             labels.append((f"join_{gid}", label))
         if upcoming:
             labels.append(("board", "Games"))
+        if member_joined_games(user.get("ig_handle") or ""):
+            labels.append(("mine", "Mine"))
         labels.append(("tips" if not is_admin(user) else "help", "Tips" if not is_admin(user) else "Help"))
 
     if not labels:
@@ -10764,7 +10944,10 @@ def _member_post_login_body(user: dict, *, signup: bool = False) -> tuple[str, O
     if inbox:
         st.session_state["_dms_flushed"] = True
     lang = user_lang(user)
-    if signup:
+    mine = member_joined_games(user.get("ig_handle") or "")
+    if mine:
+        opener = t("opener_your_games", lang) + "\n\n" + member_my_games_markdown(user)
+    elif signup:
         opener = t("signup_ok", lang)
     elif user_sees_games(user):
         opener = t("opener_games", lang)
@@ -10827,12 +11010,16 @@ def handle_logged_in(text: str) -> None:
         append_assistant(f"Back as **{at}**. Type `help` for admin commands.")
         return
 
-    # Deliver queued admin notes / day-before reminders once
-    if user and not is_admin(user) and not st.session_state.get("_dms_flushed"):
-        inbox = member_inbox_bits(user.get("ig_handle") or "")
-        if inbox:
+    # Reminders every visit (consume is once-per-window); DMs once per session
+    if user and not is_admin(user):
+        rem = consume_day_before_reminders(user.get("ig_handle") or "")
+        if rem:
+            append_assistant(rem)
+        if not st.session_state.get("_dms_flushed"):
+            dms = consume_member_dms(user.get("ig_handle") or "")
             st.session_state["_dms_flushed"] = True
-            append_assistant(inbox)
+            if dms:
+                append_assistant(dms)
 
     if lower in {"logout", "log out", "restart"}:
         st.session_state.pop("admin_real_user", None)
@@ -10871,6 +11058,10 @@ def handle_logged_in(text: str) -> None:
 
     if lower in {"today", "dash", "dashboard", "/today", "ops"} and is_admin(user):
         append_assistant(admin_today_markdown())
+        st.session_state["_admin_today_actions"] = True
+        return
+    if lower in {"mine", "my games", "my game", "/mine", "joined"}:
+        append_assistant(member_my_games_markdown(user))
         return
     if lower in {"board", "games", "/games", "list games", "upcoming", "upcoming games"}:
         if not user_sees_games(user) and not is_admin(user):
@@ -11116,6 +11307,11 @@ def main() -> None:
     if st.session_state.get("auth_state") == NEED_LANG or st.session_state.get("_show_lang_card"):
         focus_chat_input()
         return
+
+    today_cmd = render_admin_today_actions()
+    if today_cmd:
+        process_user_input(today_cmd)
+        st.rerun()
 
     quick = render_quick_actions()
     if quick:
