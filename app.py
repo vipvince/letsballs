@@ -432,10 +432,16 @@ EMOJI_AVATAR_RULES: list[dict[str, Any]] = [
         "reason": "sport emoji in bio",
     },
     {
-        "emojis": ["🍣", "🍰", "☕", "🍸", "🍜"],
+        "emojis": ["🍣", "🍰", "☕", "🍸", "🍜", "🍷", "🌶️", "🌶"],
         "files": ["foodie_cat.png", "chef_pig.png", "coffee_bear.png", "tea_bunny.png"],
         "boost": 8,
         "reason": "food/drink emoji in bio",
+    },
+    {
+        "emojis": ["🐷", "🐖", "🐗", "👩‍🍳", "👨‍🍳", "🍳"],
+        "files": ["chef_pig.png", "foodie_cat.png"],
+        "boost": 14,
+        "reason": "pig/chef emoji in bio",
     },
     {
         "emojis": ["🐼"],
@@ -6183,11 +6189,32 @@ def _looks_foodie(text: str) -> bool:
         "foodie", "sushi", "ramen", "coffee", "cafe", "dessert", "tea",
         "下午茶", "美食", "餓", "吃", "finedine", "afternoontea",
     )
-    return any(k in t for k in keys)
+    return any(_keyword_in_text(k, t) if k.isascii() else k in t for k in keys)
+
+
+def _keyword_in_text(keyword: str, text: str) -> bool:
+    """
+    Whole-word match for ASCII keywords so “book” ≠ Facebook and “recipe” ≠ web noise.
+    Emoji / CJK / multi-word phrases still use substring match.
+    """
+    if not keyword or not text:
+        return False
+    kw = keyword.lower().strip()
+    t = text.lower()
+    if not kw.isascii():
+        return keyword in text or kw in t
+    # Multi-word / punctuated phrases (e.g. afternoon tea, dog mum)
+    if re.search(r"[^a-z0-9]", kw):
+        return kw in t
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])", t))
 
 
 def _extract_bio_blob(scraped: str, scrape: Optional[dict[str, Any]] = None) -> str:
-    """Pull biography / name text so animal matching leans on the IG bio."""
+    """
+    Real IG bio / name / emojis only — never the full scrape blob.
+    Full scrape often contains Facebook / web crumbs that false-trigger keywords
+    (e.g. “book” inside Facebook, “recipe” in unrelated search snippets).
+    """
     parts: list[str] = []
     if isinstance(scrape, dict):
         fields = list(scrape.get("fields") or [])
@@ -6205,9 +6232,6 @@ def _extract_bio_blob(scraped: str, scrape: Optional[dict[str, Any]] = None) -> 
     m2 = re.search(r'on Instagram:\s*"([^"]+)"', text, re.I)
     if m2:
         parts.append(m2.group(1).strip())
-    # Keep a shorter slice of the full scrape as backup signal
-    if text:
-        parts.append(text[:900])
     return "\n".join(parts)
 
 
@@ -6217,48 +6241,58 @@ def _score_avatar(
     raw_text: str,
     *,
     bio_lower: str = "",
+    bio_raw: str = "",
 ) -> tuple[int, list[str]]:
     """Return (score, evidence bullets)."""
     score = 0
     evidence: list[str] = []
     file_name = pool_item["file"]
-    bio_l = bio_lower or blob_lower
+    bio_l = bio_lower or ""
+    # Emoji / strong bio signals only from the real bio — not web/Facebook crumbs
+    emoji_haystack = bio_raw or raw_text or ""
 
-    # Emoji rules get priority
+    # Emoji rules get priority (skip base parts already covered by a ZWJ emoji, e.g. 🍳 inside 👩‍🍳)
     for rule in EMOJI_AVATAR_RULES:
-        hit = [em for em in rule["emojis"] if em in (raw_text or "")]
+        hit = [em for em in rule["emojis"] if em in emoji_haystack]
         if not hit:
             continue
+        pruned: list[str] = []
+        for em in hit:
+            if any(em != other and em in other for other in hit):
+                continue
+            pruned.append(em)
+        hit = pruned or hit
         if file_name in rule["files"]:
             score += int(rule["boost"])
             evidence.append(f"emoji {''.join(hit)} → {rule['reason']} (+{rule['boost']})")
 
-    # Strong bio-phrase hints (prefer actual bio / name over the whole scrape blob)
+    # Strong bio-phrase hints (actual bio / name only)
     for keywords, fname, reason in BIO_AVATAR_HINTS:
         if fname != file_name:
             continue
-        hit_kw = next((kw for kw in keywords if kw.lower() in bio_l), None)
+        hit_kw = next((kw for kw in keywords if _keyword_in_text(kw, bio_l)), None)
         if hit_kw:
             score += 12
             evidence.append(f"bio “{hit_kw}” → {reason} (+12)")
             break
 
     for tag in pool_item.get("tags") or []:
-        # Emoji tags must match exactly in raw text; word tags use lowercase blob
+        # Emoji tags must match exactly in bio; word tags use whole-word match
         if len(tag) <= 2 and not tag.isascii():
             # short CJK
-            if tag in (raw_text or "") or tag.lower() in bio_l or tag.lower() in blob_lower:
-                bump = 5 if tag.lower() in bio_l else 3
+            if tag in emoji_haystack or _keyword_in_text(tag, bio_l):
+                bump = 5 if _keyword_in_text(tag, bio_l) or tag in emoji_haystack else 3
                 score += bump
                 evidence.append(f"keyword “{tag}” (+{bump})")
-        elif tag in (raw_text or ""):  # emoji tag
+        elif tag in emoji_haystack:  # emoji tag
             score += 3
             evidence.append(f"tag “{tag}”")
-        elif tag.lower() in bio_l:
+        elif _keyword_in_text(tag, bio_l):
             bump = 6 if len(tag) > 3 else 4
             score += bump
             evidence.append(f"bio tag “{tag}” (+{bump})")
-        elif tag.lower() in blob_lower:
+        elif _keyword_in_text(tag, blob_lower):
+            # Weak: full scrape / handle only — never treat as a “bio” hit
             bump = 2 if len(tag) > 3 else 1
             score += bump
             evidence.append(f"keyword “{tag}” (+{bump})")
@@ -6277,6 +6311,7 @@ def _match_avatar_from_profile(
     raw = scraped or ""
     bio_blob = _extract_bio_blob(raw, scrape)
     bio_lower = bio_blob.lower()
+    # Full scrape only for weak keyword fallback — bio hints never see this
     blob = f"{bio_blob}\n{raw}\n{handle}".lower()
     available = [p for p in AVATAR_POOL if os.path.isfile(os.path.join(AVATAR_DIR, p["file"]))]
     if not available:
@@ -6284,7 +6319,9 @@ def _match_avatar_from_profile(
 
     scored: list[tuple[int, dict[str, Any], list[str]]] = []
     for p in available:
-        sc, ev = _score_avatar(p, blob, raw, bio_lower=bio_lower)
+        sc, ev = _score_avatar(
+            p, blob, raw, bio_lower=bio_lower, bio_raw=bio_blob
+        )
         scored.append((sc, p, ev))
     scored.sort(key=lambda x: (-x[0], x[1]["file"]))
     best_score, best, evidence = scored[0]
@@ -6312,8 +6349,13 @@ def _match_avatar_from_profile(
             f"bio fit for “{best['label']}”",
         )
     elif any("emoji" in e for e in evidence):
-        raw_reason = next((e.split("→", 1)[-1].strip() for e in evidence if "emoji" in e), "emoji match")
-        reason = re.sub(r"\s*\(\+\d+\)\s*$", "", raw_reason).strip()
+        # Prefer the strongest emoji signal (highest +N), not whichever fired first
+        def _emoji_boost(line: str) -> int:
+            m = re.search(r"\(\+(\d+)\)\s*$", line)
+            return int(m.group(1)) if m else 0
+
+        top = max((e for e in evidence if "emoji" in e), key=_emoji_boost)
+        reason = re.sub(r"\s*\(\+\d+\)\s*$", "", top.split("→", 1)[-1]).strip()
     elif any(t in bio_lower for t in ("cat", "貓")) and _looks_foodie(bio_lower):
         reason = "cat lover + foodie keywords in bio"
     elif any(t in bio_lower for t in ("travel", "traveller", "旅")):
