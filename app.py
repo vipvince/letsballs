@@ -1999,6 +1999,18 @@ def mark_admin_signups_seen(signup_ids: list[int]) -> None:
         )
 
 
+def default_member_game_reminder_note(game_id: Any, when_text: str = "") -> str:
+    """Default admin→member nudge with full game details (not 'still good?')."""
+    when = format_game_when_text(when_text or "") or "soon"
+    return f"reminder — you have game #{game_id} · {when}, see ya."
+
+
+def admin_msg_game_cmd(handle: str, game_id: Any, when_text: str = "") -> str:
+    """Chat command string for Today / signup shortcuts."""
+    h = normalize_handle(handle)
+    return f"msg @{h} {default_member_game_reminder_note(game_id, when_text)}"
+
+
 def format_admin_signup_notices(rows: list[dict]) -> str:
     if not rows:
         return ""
@@ -2006,13 +2018,18 @@ def format_admin_signup_notices(rows: list[dict]) -> str:
     for r in rows:
         when = r.get("when_text") or "a game"
         loc = r.get("location") or DEFAULT_GAME_LOCATION
-        handle = r.get("ig_handle") or "?"
-        ig_url = f"https://www.instagram.com/{normalize_handle(handle)}/"
+        handle = normalize_handle(r.get("ig_handle") or "")
+        if not handle or handle in ADMIN_HANDLES:
+            continue
+        ig_url = f"https://www.instagram.com/{handle}/"
         lines.append(
             f"- @{handle} joined **#{r.get('game_id')}** "
             f"{format_game_card(when, r.get('spots'), loc)}\n"
-            f"  Contact: [IG]({ig_url}) · `msg @{normalize_handle(handle)} hey — still good for this?`"
+            f"  Contact: [IG]({ig_url}) · "
+            f"`{admin_msg_game_cmd(handle, r.get('game_id'), r.get('when_text') or '')}`"
         )
+    if len(lines) == 1:
+        return ""
     return "\n".join(lines)
 
 
@@ -3310,13 +3327,17 @@ def admin_today_markdown() -> str:
             if spots > 0:
                 blocks.append(f"→ `fill #{g['id']}`")
             if people:
+                shown = 0
                 for s in people:
                     h = normalize_handle(s.get("ig_handle") or "")
-                    if not h:
+                    if not h or h in ADMIN_HANDLES:
                         continue
                     blocks.append(
-                        f"- @{h} · `msg @{h} hey — still good for #{g['id']}?`"
+                        f"- @{h} · `{admin_msg_game_cmd(h, g['id'], g.get('when_text') or '')}`"
                     )
+                    shown += 1
+                if not shown:
+                    blocks.append("- _(admins only / nobody to nudge)_")
             else:
                 blocks.append("- _(nobody subscribed yet)_")
     with get_conn() as conn:
@@ -3340,13 +3361,19 @@ def admin_today_markdown() -> str:
     blocks.append(
         f"\n**Invites today** — {inv_n} sent · {skip_n} skipped"
     )
-    if pending:
-        blocks.append(f"**Unread joins** — {len(pending)}")
-        for r in pending[:8]:
+    pending_members = [
+        r
+        for r in pending
+        if normalize_handle(r.get("ig_handle") or "")
+        and normalize_handle(r.get("ig_handle") or "") not in ADMIN_HANDLES
+    ]
+    if pending_members:
+        blocks.append(f"**Unread joins** — {len(pending_members)}")
+        for r in pending_members[:8]:
             h = normalize_handle(r.get("ig_handle") or "")
             gid = r.get("game_id")
             blocks.append(
-                f"- @{h} → #{gid} · `msg @{h} hey — still good for #{gid}?`"
+                f"- @{h} → #{gid} · `{admin_msg_game_cmd(h, gid, r.get('when_text') or '')}`"
             )
     else:
         blocks.append("**Unread joins** — none")
@@ -3388,24 +3415,27 @@ def render_admin_today_actions() -> Optional[str]:
             with col:
                 if st.button(f"Fill #{gid}{cold}", key=f"today_fill_{gid}", use_container_width=True):
                     clicked = f"fill #{gid}"
-    # Msg buttons for registered players (cold games first), max 6
-    msg_targets: list[tuple[str, int]] = []
+    # Msg buttons for registered players (skip admins), cold games first, max 6
+    msg_targets: list[tuple[str, int, str]] = []
     for g in games:
         gid = int(g["id"])
+        when_text = g.get("when_text") or ""
         for s in g.get("signups") or []:
             h = normalize_handle(s.get("ig_handle") or "")
-            if h and (h, gid) not in msg_targets:
-                msg_targets.append((h, gid))
+            if not h or h in ADMIN_HANDLES:
+                continue
+            if (h, gid, when_text) not in msg_targets:
+                msg_targets.append((h, gid, when_text))
             if len(msg_targets) >= 6:
                 break
         if len(msg_targets) >= 6:
             break
     if msg_targets:
         cols = st.columns(min(3, len(msg_targets)))
-        for i, (h, gid) in enumerate(msg_targets):
+        for i, (h, gid, when_text) in enumerate(msg_targets):
             with cols[i % len(cols)]:
                 if st.button(f"Msg @{h}", key=f"today_msg_{h}_{gid}", use_container_width=True):
-                    clicked = f"msg @{h} hey — still good for #{gid}?"
+                    clicked = admin_msg_game_cmd(h, gid, when_text)
     if clicked:
         st.session_state.pop("_admin_today_actions", None)
     return clicked
@@ -4115,6 +4145,9 @@ def try_admin_command(text: str) -> bool:
     if dm_cmd:
         handle = normalize_handle(dm_cmd.group(1))
         note = (dm_cmd.group(2) or "").strip()
+        if handle in ADMIN_HANDLES:
+            append_assistant(f"Skipped — **@{handle}** is an admin (no need to msg yourself).")
+            return True
         actor = admin_actor() or st.session_state.get("user") or {}
         status, target = queue_admin_dm(
             handle, note, from_handle=(actor.get("ig_handle") or "vip")
