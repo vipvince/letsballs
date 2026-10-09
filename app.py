@@ -10178,6 +10178,13 @@ def run_quick_action(action: str) -> None:
             return
         append_assistant(games_board_markdown())
         return
+    if key in {"today", "dashboard"}:
+        append_user("Today", avatar=avatar)
+        if is_admin(user) and not is_impersonating():
+            append_assistant(admin_today_markdown())
+        else:
+            append_assistant("Admin dashboard only — type `back` if you’re testing a member.")
+        return
     if key in {"help", "tips"}:
         append_user("Help" if is_admin(user) else "Tips", avatar=avatar)
         if is_admin(user):
@@ -10195,19 +10202,24 @@ def render_quick_actions() -> Optional[str]:
     if not user:
         return None
 
-    upcoming = list_games() if user_sees_games(user) else []
-    open_games = [g for g in upcoming if int(g.get("spots") or 0) > 0]
-
     labels: list[tuple[str, str]] = []
-    # One Join button per open game (max 3) so the right slot is obvious
-    for g in open_games[:3]:
-        when_bit = short_game_when(g.get("when_text") or "")
-        gid = g.get("id")
-        label = f"🎾 #{gid} {when_bit}" if gid is not None else f"🎾 {when_bit}"
-        labels.append((f"join_{gid}", label))
-    if upcoming:
-        labels.append(("board", "🎾 Games"))
-    labels.append(("help" if is_admin(user) else "tips", "✨ Help" if is_admin(user) else "✨ Tips"))
+
+    # Admin ops: Today dashboard (games + who joined) instead of member Join/Games
+    if is_admin(user) and not is_impersonating():
+        labels.append(("today", "Today"))
+        labels.append(("help", "Help"))
+    else:
+        upcoming = list_games() if user_sees_games(user) else []
+        open_games = [g for g in upcoming if int(g.get("spots") or 0) > 0]
+        # One Join button per open game (max 3) so the right slot is obvious
+        for g in open_games[:3]:
+            when_bit = short_game_when(g.get("when_text") or "")
+            gid = g.get("id")
+            label = f"#{gid} {when_bit}" if gid is not None else when_bit
+            labels.append((f"join_{gid}", label))
+        if upcoming:
+            labels.append(("board", "Games"))
+        labels.append(("tips" if not is_admin(user) else "help", "Tips" if not is_admin(user) else "Help"))
 
     if not labels:
         return None
