@@ -65,6 +65,9 @@ FEED_PHOTO_MAX = 3  # public: up to 3 extra feed frames after pinned
 PINNED_PHOTO_MAX = 3  # profile pins first — clearest face signal
 VISION_MAX_IMAGES = 4  # pinned first, then HD profile, then feed
 KOL_FOLLOWER_MIN = 8_000
+# Female accounts above this follower count get a high invite score floor
+SHE_HIGH_REACH_FOLLOWERS = 10_000
+SHE_HIGH_REACH_SCORE = 95
 USE_BROWSER_IG = os.environ.get("USE_BROWSER_IG", "1").strip() not in ("0", "false", "no")
 
 # Seeded public creator knowledge when search APIs are blocked (expand as needed).
@@ -1548,10 +1551,19 @@ def drop_unfinished_handle(ig_handle: str) -> None:
 
 
 def _tell_profile_missing(at: str) -> None:
-    append_assistant(
-        f"**{at}** doesn’t exist on Instagram. "
-        "That page says the link is broken, or the account was removed."
+    lines = (
+        f"I rang every doorbell on Instagram for **{at}** — nobody home. "
+        "Ghost handle? Typo? Drop the real @ and we’ll try again.",
+        f"**{at}** isn’t a thing on Instagram. Either they vanished into the void, "
+        "or Autocorrect decided to freestyle. Double-check the spelling?",
+        f"Instagram looked at **{at}**, shrugged, and handed me a blank page. "
+        "No account there — try another handle?",
+        f"Court’s empty for **{at}**. That IG doesn’t exist (or got deleted). "
+        "Serve again with a live @?",
+        f"**{at}** → 404 vibes. Instagram says that page isn’t available. "
+        "Maybe a new handle, or a sneaky typo?",
     )
+    append_assistant(random.choice(lines))
 
 
 def _profile_card_seen(scrape: dict) -> bool:
@@ -1563,10 +1575,15 @@ def _profile_card_seen(scrape: dict) -> bool:
 
 
 def _tell_profile_unreadable(at: str) -> None:
-    append_assistant(
-        f"I couldn’t open **{at}** on Instagram just now, so that account was not signed in. "
-        "Try the handle again in a bit."
+    lines = (
+        f"Instagram put **{at}** behind frosted glass — I can see a silhouette, "
+        "not enough to sign you in. Try again in a minute?",
+        f"Almost had **{at}**, then the feed went full “brb.” "
+        "Give it another swing shortly?",
+        f"**{at}** is playing hard to get right now (login wall / empty card). "
+        "Not signed in yet — retry when IG chill.",
     )
+    append_assistant(random.choice(lines))
 
 
 def upsert_pending_user(
@@ -8479,36 +8496,154 @@ def infer_demographics(
     }
 
 
+def infer_demographics_fast(
+    scraped: str,
+    scrape: Optional[dict[str, Any]] = None,
+    handle: str = "",
+    ig_photo_path: str = "",
+) -> dict[str, str]:
+    """
+    Fast signup demographics: gender + age band only.
+    Sources: IG name/bio/emojis/followers → optional quick web search if gender unknown.
+    Skips Face++, feed vision, and DeepSeek fusion (those stay available via
+    infer_demographics for admin rescore if ever needed).
+    """
+    scrape = scrape or {}
+    identity = extract_profile_identity(scraped, scrape=scrape, handle=handle)
+    local, local_ev = _score_bio_demographics(identity)
+    g_scores = dict(local.get("gender_scores") or {})
+    nat_scores = dict(local.get("nat_scores") or {})
+    age_guess = str(local.get("age_guess") or "unknown")
+    evidence = list(local_ev)
+    steps: list[str] = ["fast_bio_name"]
+
+    gender = _pick_gender(g_scores)
+
+    # Quick web search only when bio/name didn't settle gender
+    if gender not in ("female", "male") and handle:
+        steps.append("quick_web")
+        web = scrape.get("web_search") if isinstance(scrape.get("web_search"), dict) else None
+        if not (isinstance(web, dict) and web.get("ok")):
+            web = google_enrich_profile(handle)
+            scrape["web_search"] = web
+        web_text = str((web or {}).get("text") or "")
+        if web_text:
+            identity["web_text"] = ((identity.get("web_text") or "") + " " + web_text).strip()
+            local2, ev2 = _score_bio_demographics(identity)
+            for k, v in (local2.get("gender_scores") or {}).items():
+                g_scores[k] = g_scores.get(k, 0) + float(v or 0)
+            for k, v in (local2.get("nat_scores") or {}).items():
+                nat_scores[k] = nat_scores.get(k, 0) + float(v or 0)
+            evidence.extend(ev2)
+            gender = _pick_gender(g_scores)
+            if age_guess == "unknown" and local2.get("age_guess"):
+                age_guess = str(local2.get("age_guess") or "unknown")
+            scrape["text"] = f"{scrape.get('text') or ''} | web:{web_text}"[:2400]
+        blob = web_text.lower()
+        if gender not in ("female", "male"):
+            if re.search(
+                r"\b(she|her|hers|woman|girl|female|女士|小姐|女孩|女生)\b", blob
+            ):
+                gender = "female"
+                evidence.append("quick web → she cues")
+            elif re.search(
+                r"\b(he|him|his|man|boy|male|先生|男生)\b", blob
+            ):
+                gender = "male"
+                evidence.append("quick web → he cues")
+
+    seed = _KNOWN_CREATORS.get(normalize_handle(handle)) if handle else None
+    if seed:
+        if gender not in ("female", "male") and str(seed.get("gender") or "").lower() in (
+            "female",
+            "male",
+        ):
+            gender = str(seed.get("gender")).lower()
+            evidence.append(f"seeded creator → {gender}")
+        if age_guess == "unknown" and seed.get("age_guess"):
+            age_guess = str(seed.get("age_guess"))
+            evidence.append("seeded creator age")
+
+    if gender == "unknown":
+        forced = _pick_gender(g_scores)
+        if forced in ("female", "male") and max(
+            g_scores.get("female", 0), g_scores.get("male", 0)
+        ) >= 2.5:
+            gender = forced
+            evidence.append(f"name/bio lean → {gender}")
+
+    nationality = "unknown"
+    if nat_scores:
+        nationality = max(nat_scores.items(), key=lambda kv: kv[1])[0]
+
+    followers = int(identity.get("followers") or 0)
+    if seed and followers <= 0:
+        try:
+            followers = max(0, int(seed.get("followers_guess") or 0))
+            if followers:
+                evidence.append(f"seeded follower guess → {followers:,}")
+        except (TypeError, ValueError):
+            pass
+    visibility = str(scrape.get("visibility") or "unknown").lower()
+    profile_rel = ig_photo_path or scrape.get("ig_photo_path") or ""
+    profile_meta = scrape.get("profile_photo_meta") or (
+        _image_file_meta(profile_rel) if profile_rel else {}
+    )
+    name_bit = identity.get("full_name") or ""
+    if identity.get("first_name") or identity.get("last_name"):
+        name_bit = (
+            f"{identity.get('first_name', '')} {identity.get('last_name', '')}".strip()
+            or name_bit
+        )
+    is_kol = followers >= KOL_FOLLOWER_MIN
+    if is_kol:
+        evidence.append(f"followers {followers:,} → high reach")
+
+    return {
+        "gender": gender or "unknown",
+        "nationality": nationality or "unknown",
+        "age_guess": age_guess or "unknown",
+        "full_name": identity.get("full_name") or "",
+        "first_name": identity.get("first_name") or "",
+        "last_name": identity.get("last_name") or "",
+        "evidence": "; ".join(dict.fromkeys(evidence)) or "thin public signal",
+        "photo_ok": "yes" if profile_rel else "no",
+        "photo_note": "fast path — no Face++ / feed vision",
+        "vision_photos": "0",
+        "name_display": name_bit,
+        "followers": str(followers),
+        "is_kol": "yes" if is_kol else "no",
+        "kol_niche": "creator" if is_kol else "none",
+        "visibility": visibility,
+        "profile_hd": "yes" if (profile_meta.get("full_res") or profile_meta.get("hd")) else "no",
+        "profile_wxh": f"{profile_meta.get('width', 0)}x{profile_meta.get('height', 0)}",
+        "profile_bytes": str(profile_meta.get("bytes") or 0),
+        "feed_count": "0",
+        "pin_count": "0",
+        "pipeline": " > ".join(steps),
+    }
+
+
 def resolve_member_profile(handle: str) -> dict[str, Any]:
     """
-    Onboarding research pipeline (lazy where possible):
-      1) Threads/IG scrape first (fast path when Threads card is enough)
-      2) Web/LLM research only if scrape is thin or demographics need help
-      3) Demographics fusion
+    Onboarding research (fast):
+      1) Threads/IG public card
+      2) Gender + age from name/bio (+ quick web only if gender unknown)
+      3) Character assign stays bio-first elsewhere
     """
     handle = normalize_handle(handle)
-    # Scrape first — Threads cache often makes this cheap
     scrape = scrape_instagram_bio(handle, skip_web=True)
-    card_ok = _profile_card_seen(scrape)
-    research: dict[str, Any] = {}
-    # Skip expensive web+LLM when we already have a solid public card + photo
-    if not card_ok or not scrape.get("ig_photo_path"):
-        research = research_handle_before_ig(handle)
-        if research:
-            scrape["web_research"] = research
-            web = research.get("web") if isinstance(research.get("web"), dict) else research
-            scrape["web_search"] = web
-            if isinstance(web, dict) and web.get("text"):
-                scrape["text"] = f"{scrape.get('text') or ''} | web:{web['text']}"[:2400]
-    else:
-        research = {"ok": False, "note": "skipped web research — Threads/IG card was enough"}
     scraped = scrape.get("text") or f"instagram_handle:{handle}"
-    demo = infer_demographics(
+    demo = infer_demographics_fast(
         scraped,
         scrape=scrape,
         handle=handle,
         ig_photo_path=scrape.get("ig_photo_path") or "",
     )
+    research = scrape.get("web_search") or {
+        "ok": False,
+        "note": "fast path — web only if gender unknown",
+    }
     return {
         "handle": handle,
         "research": research,
@@ -8545,7 +8680,8 @@ def format_demographics_line(demo: dict[str, str]) -> str:
     if ev:
         short = ev if len(ev) < 220 else ev[:217] + "…"
         bits.append(f"_Signals: {short}_")
-    bits.append("_Pipeline: web/KOL → IG photos → name/bio — estimate, not verified._")
+    pipe = demo.get("pipeline") or "fast bio/name"
+    bits.append(f"_Pipeline: {pipe} (gender + age; estimate, not verified)._")
     return "\n".join(bits)
 
 
@@ -8614,14 +8750,25 @@ def _age_clearly_forty_plus(age_guess: str) -> bool:
     return False
 
 
+def _demo_followers(demo: Optional[dict]) -> int:
+    if not demo:
+        return 0
+    raw = demo.get("followers")
+    try:
+        return max(0, int(str(raw or "0").replace(",", "").strip() or "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
 def compute_invite_score(
     demo: dict[str, str],
     *,
     override: Optional[int] = None,
 ) -> tuple[int, str]:
     """
-    Silent 0–100 invite score from gender + age. Never shown to members.
-    Target profile (female + under 40) ≈ 90; previous gate-out ≈ 15–25.
+    Silent 0–100 invite score from gender + age (+ high-reach she boost).
+    Never shown to members. Target (female + under 40) ≈ 90;
+    female with >10k followers floors at SHE_HIGH_REACH_SCORE.
     """
     if override is not None:
         try:
@@ -8636,6 +8783,7 @@ def compute_invite_score(
 
     gender = (demo.get("gender") or "").strip().lower() or "unknown"
     age = (demo.get("age_guess") or "").strip() or "unknown"
+    followers = _demo_followers(demo)
 
     if gender == "female":
         g_pts, g_why = 50, "female"
@@ -8652,10 +8800,18 @@ def compute_invite_score(
         a_pts, a_why = 10, "unclear / unknown"
 
     score = max(0, min(100, g_pts + a_pts))
+    reach_note = ""
+    if gender == "female" and followers > SHE_HIGH_REACH_FOLLOWERS:
+        score = max(score, SHE_HIGH_REACH_SCORE)
+        reach_note = (
+            f"- Reach: **{followers:,}** followers (she + >{SHE_HIGH_REACH_FOLLOWERS:,}) "
+            f"→ floor **{SHE_HIGH_REACH_SCORE}**\n"
+        )
     detail = (
         f"Invite score **{score}**/100 (admin only — never tell the member).\n"
         f"- Gender: {gender} → +{g_pts} ({g_why})\n"
         f"- Age: {age} → +{a_pts} ({a_why})\n"
+        f"{reach_note}"
         f"- Games board if score ≥ {GAMES_VISIBLE_MIN}; "
         f"soft invites from {INVITE_ELIGIBLE_MIN}+ when a game is cold/urgent "
         f"(pass ≈ {INVITE_PASS_THRESHOLD}, urgent bar ≈ {INVITE_URGENT_THRESHOLD})."
@@ -11044,6 +11200,7 @@ def _prepare_ig_signup(handle: str) -> dict[str, Any]:
         {
             "gender": demo.get("gender") or "",
             "age_guess": demo.get("age_guess") or "",
+            "followers": demo.get("followers") or "0",
         },
         override=override,
     )
