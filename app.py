@@ -2611,7 +2611,7 @@ def _invite_cohort_ok(score: int, game: dict, *, now: Optional[datetime] = None)
     Prefer high scores first; expand to lower scores when the game still needs people.
       ≥70  — preferred (always eligible for a soft-invite roll)
       40–69 — mid: only if <2 signups or cold/soon
-      15–39 — low: only if empty or ≤1 day out
+      15–39 — low: only if empty or ≤3 days out
     """
     now = now or hk_now()
     signed = game_signup_count(game)
@@ -2626,7 +2626,7 @@ def _invite_cohort_ok(score: int, game: dict, *, now: Optional[datetime] = None)
     if score >= GAMES_VISIBLE_MIN:
         return signed < 2 or cold
     if score >= INVITE_ELIGIBLE_MIN:
-        return signed == 0 or days <= 1
+        return signed == 0 or days <= 3
     return False
 
 
