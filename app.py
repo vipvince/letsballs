@@ -2437,8 +2437,8 @@ def remove_signup_reply(status: str, handle: str, game: dict) -> str:
 
 def maybe_game_invite(reply: str = "", user: Optional[dict] = None) -> str:
     """
-    Soft invite via daily lock + urgency-weighted random.
-    Prefer cold games (<2 signups or ≤2 days) so fill rate recovers.
+    Soft invite: high scores first, then lower when a game still needs people.
+    Prefer cold games (<2 signups or ≤2 days) for fill recovery.
     """
     u = user or st.session_state.get("user")
     if not u or not user_can_be_invited(u):
@@ -2606,6 +2606,30 @@ def _natural_game_invite_copy(game: dict, lang: Optional[str] = None) -> str:
     return t(random.choice(keys), code, label=label, loc=loc)
 
 
+def _invite_cohort_ok(score: int, game: dict, *, now: Optional[datetime] = None) -> bool:
+    """
+    Prefer high scores first; expand to lower scores when the game still needs people.
+      ≥70  — preferred (always eligible for a soft-invite roll)
+      40–69 — mid: only if <2 signups or cold/soon
+      15–39 — low: only if empty or ≤1 day out
+    """
+    now = now or hk_now()
+    signed = game_signup_count(game)
+    dt = game_when_datetime(game, now=now)
+    days = 999
+    if dt is not None:
+        days = max(0, (dt.date() - now.date()).days)
+    cold = game_is_cold(game, now=now)
+
+    if score >= 70:
+        return True
+    if score >= GAMES_VISIBLE_MIN:
+        return signed < 2 or cold
+    if score >= INVITE_ELIGIBLE_MIN:
+        return signed == 0 or days <= 1
+    return False
+
+
 def evaluate_game_invite(
     ig_handle: str,
     game: dict,
@@ -2614,9 +2638,8 @@ def evaluate_game_invite(
     now: Optional[datetime] = None,
 ) -> str:
     """
-    Run daily lock + weighted random for one game.
-    Returns invite copy when INVITED, else "".
-    Cold games (<2 signups / ≤2 days) use a lower pass bar and force re-rolls.
+    Soft invite: high scores first, then lower scores when underfilled.
+    Weight = score × urgency × luck vs pass bar (lower bar when cold).
     """
     now = now or hk_now()
     handle = normalize_handle(ig_handle)
@@ -2656,6 +2679,20 @@ def evaluate_game_invite(
         urgency = max(urgency, 2.0)
     luck = random.uniform(INVITE_RAND_LOW, INVITE_RAND_HIGH)
     weight = float(score) * float(urgency) * luck
+
+    # Not in the active cohort for this fill state → skip (expand later when colder)
+    if not _invite_cohort_ok(score, game, now=now):
+        _save_invite_eval(
+            int(game["id"]),
+            handle,
+            eval_date,
+            "SKIPPED_LOCK",
+            weight,
+            score,
+            urgency,
+        )
+        return ""
+
     if cold:
         threshold = float(INVITE_COLD_THRESHOLD)
     elif urgent or not user_sees_games(u):
@@ -2669,7 +2706,7 @@ def evaluate_game_invite(
         )
         return _natural_game_invite_copy(game, user_lang(u))
 
-    # Cold + solid score: one more luck roll so fill rate recovers
+    # Cold + preferred/mid score: one more luck roll so fill rate recovers
     if cold and score >= GAMES_VISIBLE_MIN and random.random() < 0.45:
         _save_invite_eval(
             int(game["id"]), handle, eval_date, "INVITED", weight, score, urgency
@@ -3150,7 +3187,7 @@ def invite_fairness_markdown(*, eval_date: Optional[str] = None) -> str:
     blocks = [
         f"**Invite fairness · {day} (HK)**",
         f"_Pass bar normal ≈ {INVITE_PASS_THRESHOLD} · urgent ≈ {INVITE_URGENT_THRESHOLD} · cold ≈ {INVITE_COLD_THRESHOLD}_",
-        "_weight = score × urgency × luck (0.8–1.2)_",
+        "_Prefer score ≥70 first; expand to mid/low when underfilled. weight = score × urgency × luck_",
     ]
     if not items:
         blocks.append("_No invite rolls logged today yet._")
@@ -8766,9 +8803,8 @@ def compute_invite_score(
     override: Optional[int] = None,
 ) -> tuple[int, str]:
     """
-    Silent 0–100 invite score from gender + age (+ high-reach she boost).
-    Never shown to members. Target (female + under 40) ≈ 90;
-    female with >10k followers floors at SHE_HIGH_REACH_SCORE.
+    Silent 0–100 invite score from gender + age (+ high-reach she → 95).
+    Never shown to members. Target (female + under 40) = 90.
     """
     if override is not None:
         try:
@@ -8786,26 +8822,26 @@ def compute_invite_score(
     followers = _demo_followers(demo)
 
     if gender == "female":
-        g_pts, g_why = 50, "female"
+        g_pts, g_why = 45, "female"
     elif gender == "male":
-        g_pts, g_why = 5, "male"
+        g_pts, g_why = 0, "male"
     else:
-        g_pts, g_why = 15, "unknown"
+        g_pts, g_why = 25, "unknown"
 
     if _age_under_forty(age):
-        a_pts, a_why = 40, "clearly under 40"
+        a_pts, a_why = 45, "clearly under 40"
     elif _age_clearly_forty_plus(age):
         a_pts, a_why = 0, "clearly 40+"
     else:
-        a_pts, a_why = 10, "unclear / unknown"
+        a_pts, a_why = 25, "unclear / unknown"
 
     score = max(0, min(100, g_pts + a_pts))
     reach_note = ""
     if gender == "female" and followers > SHE_HIGH_REACH_FOLLOWERS:
-        score = max(score, SHE_HIGH_REACH_SCORE)
+        score = SHE_HIGH_REACH_SCORE
         reach_note = (
             f"- Reach: **{followers:,}** followers (she + >{SHE_HIGH_REACH_FOLLOWERS:,}) "
-            f"→ floor **{SHE_HIGH_REACH_SCORE}**\n"
+            f"→ score **{SHE_HIGH_REACH_SCORE}**\n"
         )
     detail = (
         f"Invite score **{score}**/100 (admin only — never tell the member).\n"
@@ -8813,8 +8849,9 @@ def compute_invite_score(
         f"- Age: {age} → +{a_pts} ({a_why})\n"
         f"{reach_note}"
         f"- Games board if score ≥ {GAMES_VISIBLE_MIN}; "
-        f"soft invites from {INVITE_ELIGIBLE_MIN}+ when a game is cold/urgent "
-        f"(pass ≈ {INVITE_PASS_THRESHOLD}, urgent bar ≈ {INVITE_URGENT_THRESHOLD})."
+        f"soft invites prefer high scores first, then expand when a game needs people "
+        f"(pass ≈ {INVITE_PASS_THRESHOLD}, urgent ≈ {INVITE_URGENT_THRESHOLD}, "
+        f"cold ≈ {INVITE_COLD_THRESHOLD})."
     )
     return score, detail
 
